@@ -2,6 +2,14 @@
 
 Laravel 11 package for local/staging database query diagnostics.
 
+## Compatibility
+- PHP `8.1+`
+- Laravel `10.x` or `11.x`
+
+Install note:
+- On PHP 8.1 projects, Composer will install Laravel 10 compatible dependencies.
+- On PHP 8.2+ projects, Composer can install Laravel 11 compatible dependencies.
+
 ## Features
 - `DB::listen` query interception
 - N+1 suspicion signals

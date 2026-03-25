@@ -13,7 +13,11 @@ class EnsureDbOptimizerAccess
      */
     public function handle(Request $request, Closure $next): Response
     {
-        abort_unless(app()->environment('local') || app()->hasDebugModeEnabled(), 403);
+        $debugEnabled = method_exists(app(), 'hasDebugModeEnabled')
+            ? app()->hasDebugModeEnabled()
+            : (bool) config('app.debug', false);
+
+        abort_unless(app()->environment('local') || $debugEnabled, 403);
 
         return $next($request);
     }
