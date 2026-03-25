@@ -3,6 +3,7 @@
 return [
     'enabled' => env('DB_OPTIMIZER_ENABLED', env('APP_ENV') === 'local'),
     'capture_console' => env('DB_OPTIMIZER_CAPTURE_CONSOLE', false),
+    'capture_testing' => env('DB_OPTIMIZER_CAPTURE_TESTING', false),
     'sample_rate' => (float) env('DB_OPTIMIZER_SAMPLE_RATE', 1.0),
 
     'slow_query_threshold_ms' => (float) env('DB_OPTIMIZER_SLOW_MS', 50),
@@ -18,4 +19,6 @@ return [
     ],
 
     'route_prefix' => env('DB_OPTIMIZER_ROUTE_PREFIX', '_db-optimizer'),
+    'register_dashboard_routes' => env('DB_OPTIMIZER_REGISTER_DASHBOARD_ROUTES', true),
+    'register_agent_routes' => env('DB_OPTIMIZER_REGISTER_AGENT_ROUTES', true),
 ];

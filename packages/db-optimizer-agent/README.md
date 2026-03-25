@@ -46,6 +46,9 @@ php artisan vendor:publish --tag=db-optimizer-config
 DB_OPTIMIZER_ENABLED=true
 DB_OPTIMIZER_AGENT_TOKEN=change-me
 DB_OPTIMIZER_ROUTE_PREFIX=_db-optimizer
+DB_OPTIMIZER_CAPTURE_TESTING=false
+DB_OPTIMIZER_REGISTER_DASHBOARD_ROUTES=true
+DB_OPTIMIZER_REGISTER_AGENT_ROUTES=true
 ```
 
 5. Visit dashboard:
@@ -71,3 +74,5 @@ Send `Authorization: Bearer <DB_OPTIMIZER_AGENT_TOKEN>`.
 ## Notes
 - Use in local/staging first.
 - Keep `DB_OPTIMIZER_ENABLED=false` in production unless you intentionally sample traffic.
+- For existing projects with route conflicts, change `DB_OPTIMIZER_ROUTE_PREFIX`.
+- If you only want scanner API, set `DB_OPTIMIZER_REGISTER_DASHBOARD_ROUTES=false`.

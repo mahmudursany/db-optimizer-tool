@@ -94,6 +94,10 @@ class QueryInterceptor
             return false;
         }
 
+        if (app()->runningUnitTests() && ! (bool) config('db_optimizer.capture_testing', false)) {
+            return false;
+        }
+
         if (app()->runningInConsole() && ! (bool) config('db_optimizer.capture_console', false)) {
             return false;
         }
