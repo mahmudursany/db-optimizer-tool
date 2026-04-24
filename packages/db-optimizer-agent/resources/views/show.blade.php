@@ -32,9 +32,24 @@
 								<div class="text-xs font-medium text-slate-200">{{ $recommendation['title'] ?? 'Recommendation' }}</div>
 								<div class="text-xs text-slate-400 mt-1">{{ $recommendation['description'] ?? '' }}</div>
 
+								@if(!empty($recommendation['current_laravel']))
+									<div class="text-xs text-sky-300 mt-2">Current Laravel Query</div>
+									<pre class="text-xs overflow-x-auto whitespace-pre-wrap bg-slate-900 border border-slate-800 rounded p-3">{{ $recommendation['current_laravel'] }}</pre>
+								@endif
+
+								@if(!empty($recommendation['optimized_laravel']))
+									<div class="text-xs text-emerald-300 mt-2">Optimized Laravel Query</div>
+									<pre class="text-xs overflow-x-auto whitespace-pre-wrap bg-slate-900 border border-slate-800 rounded p-3">{{ $recommendation['optimized_laravel'] }}</pre>
+								@endif
+
 								@if(!empty($recommendation['optimized_sql']))
 									<div class="text-xs text-emerald-300 mt-2">New Query</div>
 									<pre class="text-xs overflow-x-auto whitespace-pre-wrap bg-slate-900 border border-slate-800 rounded p-3">{{ $recommendation['optimized_sql'] }}</pre>
+								@endif
+
+								@if(!empty($recommendation['executable_sql']))
+									<div class="text-xs text-amber-300 mt-2">Executable SQL (Safe/Guarded)</div>
+									<pre class="text-xs overflow-x-auto whitespace-pre-wrap bg-slate-900 border border-slate-800 rounded p-3">{{ $recommendation['executable_sql'] }}</pre>
 								@endif
 							</div>
 						@endforeach

@@ -17,6 +17,8 @@ Install note:
 - Cache candidate hints
 - Advanced optimization suggestions with code hints
 - Rewritten "New Query" suggestions shown under detected queries
+- Executable guarded SQL for index suggestions (safe to rerun)
+- Laravel-style current and optimized query snippets for direct copy/paste
 - Optional safe auto-apply eligibility flags
 - Built-in dashboard + remote scanner + protected agent API
 

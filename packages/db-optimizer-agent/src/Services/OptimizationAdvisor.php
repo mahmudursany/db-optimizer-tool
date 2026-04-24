@@ -20,6 +20,7 @@ class OptimizationAdvisor
         $recommendations = [];
         $sql = (string) ($metric['raw_sql'] ?? $event->sql);
         $normalizedSql = $this->normalizeSql($event->sql);
+        $currentLaravel = $this->buildLaravelBuilderFromSql($sql);
 
         if (str_starts_with($normalizedSql, 'select') && str_contains($normalizedSql, 'select *')) {
             $optimized = preg_replace('/\bselect\s+\*/i', 'SELECT id /* add required columns */', $sql) ?? $sql;
@@ -30,6 +31,8 @@ class OptimizationAdvisor
                 $optimized,
                 92,
                 true,
+                currentLaravel: $currentLaravel,
+                optimizedLaravel: $this->optimizeSelectAllLaravel($currentLaravel),
             );
         }
 
@@ -42,6 +45,10 @@ class OptimizationAdvisor
                 $optimized,
                 86,
                 true,
+                currentLaravel: $currentLaravel,
+                optimizedLaravel: str_contains($currentLaravel, '->exists()')
+                    ? $currentLaravel
+                    : "// Prefer exists() for presence checks\n".$currentLaravel,
             );
         }
 
@@ -54,6 +61,8 @@ class OptimizationAdvisor
                 $optimized,
                 88,
                 true,
+                currentLaravel: $currentLaravel,
+                optimizedLaravel: $this->rewriteLaravelCountToExists($currentLaravel),
             );
         }
 
@@ -65,6 +74,8 @@ class OptimizationAdvisor
                 "Model::query()->with(['relationName'])->get();",
                 98,
                 false,
+                currentLaravel: null,
+                optimizedLaravel: null,
             );
         }
 
@@ -73,14 +84,22 @@ class OptimizationAdvisor
             $table = is_array($first) ? (string) ($first['table'] ?? 'table_name') : 'table_name';
             $column = is_array($first) ? (string) ($first['column'] ?? 'column_name') : 'column_name';
 
-            $recommendations[] = $this->make(
-                'Add index for filter/join column',
-                'Missing leading index detected for a WHERE/JOIN column.',
-                $sql,
-                "ALTER TABLE `{$table}` ADD INDEX `idx_{$table}_{$column}` (`{$column}`);",
-                95,
-                false,
-            );
+            if ($table !== '' && $column !== '' && strtolower($column) !== 'id') {
+                $idxName = $this->safeIndexName($table, $column);
+                $guardedSql = $this->buildGuardedIndexSql($table, $column, $idxName);
+
+                $recommendations[] = $this->make(
+                    'Add index for filter/join column',
+                    'Missing leading index detected for a WHERE/JOIN column. Run the guarded SQL below; it will skip safely if an index already exists.',
+                    $sql,
+                    "ALTER TABLE `{$table}` ADD INDEX `{$idxName}` (`{$column}`);",
+                    95,
+                    false,
+                    executableSql: $guardedSql,
+                    currentLaravel: $currentLaravel,
+                    optimizedLaravel: $this->buildLaravelIndexMigrationSnippet($table, $column, $idxName),
+                );
+            }
         }
 
         if ((bool) Arr::get($metric, 'detectors.cache_candidate.is_candidate', false)) {
@@ -91,6 +110,8 @@ class OptimizationAdvisor
                 "Cache::remember('db-opt-key', 300, fn () => DB::select(\"{$this->escapeForPhpString($event->sql)}\"));",
                 84,
                 true,
+                currentLaravel: $currentLaravel,
+                optimizedLaravel: "Cache::remember('db-opt-key', 300, fn () =>\n    {$currentLaravel}\n);",
             );
         }
 
@@ -102,6 +123,8 @@ class OptimizationAdvisor
                 'SELECT ... WHERE id < :last_seen_id ORDER BY id DESC LIMIT 12',
                 76,
                 false,
+                currentLaravel: $currentLaravel,
+                optimizedLaravel: "// Keyset pagination example\nDB::table('table_name')\n    ->where('id', '<', \$lastSeenId)\n    ->orderByDesc('id')\n    ->limit(12)\n    ->get();",
             );
         }
 
@@ -113,13 +136,15 @@ class OptimizationAdvisor
                 '-- add/selective indexes on WHERE + JOIN columns; avoid filesort/temporary --',
                 93,
                 false,
+                currentLaravel: $currentLaravel,
+                optimizedLaravel: null,
             );
         }
 
         foreach ($recommendations as &$recommendation) {
             if ((bool) config('db_optimizer.auto_apply_safe_optimizations', false) && ($recommendation['safe_auto_apply'] ?? false)) {
                 $recommendation['auto_apply_eligible'] = true;
-+                $recommendation['auto_applied'] = false;
+                $recommendation['auto_applied'] = false;
             }
         }
         unset($recommendation);
@@ -158,16 +183,211 @@ class OptimizationAdvisor
         string $optimizedSql,
         int $priority,
         bool $safeAutoApply,
+        ?string $executableSql = null,
+        ?string $currentLaravel = null,
+        ?string $optimizedLaravel = null,
     ): array {
         return [
             'title' => $title,
             'description' => $description,
             'current_sql' => $currentSql,
             'optimized_sql' => $optimizedSql,
+            'executable_sql' => $executableSql,
+            'current_laravel' => $currentLaravel,
+            'optimized_laravel' => $optimizedLaravel,
             'priority' => $priority,
             'safe_auto_apply' => $safeAutoApply,
             'auto_apply_eligible' => false,
         ];
+    }
+
+    private function safeIndexName(string $table, string $column): string
+    {
+        return 'idx_'.preg_replace('/[^a-zA-Z0-9_]+/', '_', $table.'_'.$column);
+    }
+
+    private function buildGuardedIndexSql(string $table, string $column, string $indexName): string
+    {
+        $tableEsc = str_replace("'", "''", $table);
+        $columnEsc = str_replace("'", "''", $column);
+
+        return <<<SQL
+-- Safe to run multiple times on MySQL
+SET @dbopt_idx_exists := (
+    SELECT COUNT(1)
+    FROM information_schema.statistics
+    WHERE table_schema = DATABASE()
+      AND table_name = '{$tableEsc}'
+      AND column_name = '{$columnEsc}'
+      AND seq_in_index = 1
+);
+
+SET @dbopt_stmt := IF(
+    @dbopt_idx_exists = 0,
+    'ALTER TABLE `{$table}` ADD INDEX `{$indexName}` (`{$column}`)',
+    'SELECT "skip: index already exists for {$table}.{$column}"'
+);
+
+PREPARE dbopt_query FROM @dbopt_stmt;
+EXECUTE dbopt_query;
+DEALLOCATE PREPARE dbopt_query;
+SQL;
+    }
+
+    private function buildLaravelIndexMigrationSnippet(string $table, string $column, string $indexName): string
+    {
+        $tableEsc = addslashes($table);
+        $columnEsc = addslashes($column);
+        $indexEsc = addslashes($indexName);
+
+        return <<<PHP
+use Illuminate\\Database\\Schema\\Blueprint;
+use Illuminate\\Support\\Facades\\DB;
+use Illuminate\\Support\\Facades\\Schema;
+
+Schema::table('{$tableEsc}', function (Blueprint \$table) {
+    \$exists = DB::selectOne("\
+        SELECT COUNT(1) AS c
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE()
+          AND table_name = '{$tableEsc}'
+          AND column_name = '{$columnEsc}'
+          AND seq_in_index = 1
+    ");
+
+    if (((int) (\$exists->c ?? 0)) === 0) {
+        \$table->index('{$columnEsc}', '{$indexEsc}');
+    }
+});
+PHP;
+    }
+
+    private function optimizeSelectAllLaravel(string $currentLaravel): string
+    {
+        if ($currentLaravel === '') {
+            return $currentLaravel;
+        }
+
+        if (str_contains($currentLaravel, "->select('*')")) {
+            return str_replace("->select('*')", "->select(['id']) // add required columns", $currentLaravel);
+        }
+
+        return $currentLaravel;
+    }
+
+    private function rewriteLaravelCountToExists(string $currentLaravel): string
+    {
+        if ($currentLaravel === '') {
+            return $currentLaravel;
+        }
+
+        if (str_contains($currentLaravel, '->count()')) {
+            return str_replace('->count();', '->exists();', $currentLaravel);
+        }
+
+        return "// Use exists() if checking only presence\n".$currentLaravel;
+    }
+
+    private function buildLaravelBuilderFromSql(string $sql): string
+    {
+        $flatSql = preg_replace('/\s+/', ' ', trim($sql)) ?? trim($sql);
+
+        if (! str_starts_with(strtolower($flatSql), 'select ')) {
+            return 'DB::statement("'.addslashes($flatSql).'");';
+        }
+
+        if (! preg_match('/select\s+(.+?)\s+from\s+`?([a-zA-Z_][\w]*)`?/i', $flatSql, $selectAndFrom)) {
+            return 'DB::select("'.addslashes($flatSql).'");';
+        }
+
+        $selectRaw = trim($selectAndFrom[1] ?? '*');
+        $table = $selectAndFrom[2] ?? 'table_name';
+        $builder = ["DB::table('{$table}')"];
+
+        $joins = [];
+        preg_match_all('/\bjoin\s+`?([a-zA-Z_][\w]*)`?\s+on\s+([^\s]+)\s*=\s*([^\s]+)(?:\s|$)/i', $flatSql, $joinMatches, PREG_SET_ORDER);
+        foreach ($joinMatches as $join) {
+            $joinTable = $join[1] ?? null;
+            $left = isset($join[2]) ? trim($join[2], '` ') : null;
+            $right = isset($join[3]) ? trim($join[3], '` ') : null;
+
+            if ($joinTable && $left && $right) {
+                $joins[] = "    ->join('{$joinTable}', '{$left}', '=', '{$right}')";
+            }
+        }
+
+        $whereChains = [];
+        if (preg_match('/\bwhere\b\s+(.+?)(?:\border\s+by\b|\blimit\b|\boffset\b|$)/i', $flatSql, $wherePart)) {
+            $whereExpr = trim($wherePart[1] ?? '');
+            $conditions = preg_split('/\s+and\s+/i', $whereExpr) ?: [];
+
+            foreach ($conditions as $condition) {
+                if (preg_match('/`?([a-zA-Z_][\w\.]+)`?\s*(=|>=|<=|>|<|!=|<>)\s*(.+)$/i', trim($condition), $c)) {
+                    $column = trim($c[1], '` ');
+                    $operator = $c[2] ?? '=';
+                    $value = trim($c[3] ?? '?', ' ');
+                    $whereChains[] = "    ->where('{$column}', '{$operator}', {$this->toPhpLiteral($value)})";
+                }
+            }
+        }
+
+        if (! empty($joins)) {
+            $builder = array_merge($builder, $joins);
+        }
+
+        if (! empty($whereChains)) {
+            $builder = array_merge($builder, $whereChains);
+        }
+
+        if (preg_match('/\border\s+by\s+`?([a-zA-Z_][\w\.]*)`?\s*(asc|desc)?/i', $flatSql, $order)) {
+            $orderBy = trim($order[1] ?? '', '` ');
+            $direction = strtolower($order[2] ?? 'asc');
+            $builder[] = $direction === 'desc'
+                ? "    ->orderByDesc('{$orderBy}')"
+                : "    ->orderBy('{$orderBy}')";
+        }
+
+        if (str_contains(strtolower($flatSql), ' distinct')) {
+            $builder[] = '    ->distinct()';
+        }
+
+        if ($selectRaw === '*') {
+            $builder[] = "    ->select('*')";
+        } else {
+            $columns = array_map(static function (string $column): string {
+                return trim(trim($column), '`');
+            }, explode(',', $selectRaw));
+            $columns = array_values(array_filter($columns, static fn (string $c): bool => $c !== ''));
+            $columnPhp = implode(', ', array_map(static fn (string $c): string => "'{$c}'", $columns));
+            $builder[] = "    ->select([{$columnPhp}])";
+        }
+
+        if (preg_match('/\blimit\s+(\d+)/i', $flatSql, $limit)) {
+            $builder[] = '    ->limit('.(int) ($limit[1] ?? 0).')';
+        }
+
+        return implode("\n", $builder)."\n    ->get();";
+    }
+
+    private function toPhpLiteral(string $value): string
+    {
+        $trimmed = trim($value);
+
+        if ($trimmed === '?') {
+            return '$value';
+        }
+
+        if (is_numeric($trimmed)) {
+            return $trimmed;
+        }
+
+        $trimmed = trim($trimmed, "'\"");
+
+        if (strtolower($trimmed) === 'null') {
+            return 'null';
+        }
+
+        return "'".addslashes($trimmed)."'";
     }
 
     private function escapeForPhpString(string $sql): string
