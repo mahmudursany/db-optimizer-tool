@@ -22,8 +22,9 @@ class OptimizationAdvisor
         $normalizedSql = $this->normalizeSql($event->sql);
         $sourceCurrent = trim((string) Arr::get($metric, 'source_code.current', ''));
         $currentLaravel = $sourceCurrent !== '' ? $sourceCurrent : $this->buildLaravelBuilderFromSql($sql);
+        $sourceHasNPlusOnePattern = $this->sourceLooksLikeNPlusOne($currentLaravel);
 
-        if (str_starts_with($normalizedSql, 'select') && str_contains($normalizedSql, 'select *')) {
+        if (str_starts_with($normalizedSql, 'select') && str_contains($normalizedSql, 'select *') && ! $sourceHasNPlusOnePattern) {
             $optimized = preg_replace('/\bselect\s+\*/i', 'SELECT id /* add required columns */', $sql) ?? $sql;
             $recommendations[] = $this->make(
                 'Select only needed columns',
@@ -67,7 +68,7 @@ class OptimizationAdvisor
             );
         }
 
-        if ((bool) Arr::get($metric, 'detectors.n_plus_one.is_suspected', false)) {
+        if ((bool) Arr::get($metric, 'detectors.n_plus_one.is_suspected', false) || $sourceHasNPlusOnePattern) {
             $optimizedNPlusOne = $this->rewriteNPlusOneLaravel($currentLaravel);
 
             $recommendations[] = $this->make(
@@ -290,12 +291,23 @@ SQL;
         }
 
         $relationsByVar = [];
+        $foreachItemToCollection = [];
         $removeIndexes = [];
+
+        foreach ($lines as $line) {
+            if (preg_match('/^\s*foreach\s*\(\s*\$(\w+)\s+as\s+\$(\w+)\s*\)/', $line, $m)) {
+                $collectionVar = $m[1];
+                $itemVar = $m[2];
+                $foreachItemToCollection[$itemVar] = $collectionVar;
+            }
+        }
 
         foreach ($lines as $i => $line) {
             if (preg_match('/^\s*\$(\w+)->([a-zA-Z_][\w]*)\s*;\s*(?:\/\/.*)?$/', $line, $m)) {
-                $var = $m[1];
+                $sourceVar = $m[1];
                 $relation = $m[2];
+
+                $var = $foreachItemToCollection[$sourceVar] ?? $sourceVar;
 
                 if (! isset($relationsByVar[$var])) {
                     $relationsByVar[$var] = [];
@@ -330,6 +342,22 @@ SQL;
         }
 
         return implode("\n", $filtered);
+    }
+
+    private function sourceLooksLikeNPlusOne(string $source): bool
+    {
+        if ($source === '') {
+            return false;
+        }
+
+        $hasForeach = (bool) preg_match('/\bforeach\s*\(/', $source);
+        $lazyCalls = preg_match_all('/^\s*\$\w+->[a-zA-Z_][\w]*\s*;\s*(?:\/\/.*)?$/m', $source);
+
+        if ($hasForeach && $lazyCalls >= 1) {
+            return true;
+        }
+
+        return (bool) preg_match('/^\s*\$\w+->[a-zA-Z_][\w]*\s*;\s*(?:\/\/.*)?$/m', $source);
     }
 
     /**
