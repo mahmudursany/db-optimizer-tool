@@ -140,7 +140,10 @@ class QueryInterceptor
     private function nPlusOneSignal(string $sql, int $repetition, array $origin): array
     {
         $threshold = (int) config('db_optimizer.n_plus_one_repeat_threshold', 5);
-        $looksLikeSingleRow = (bool) preg_match('/\bwhere\b.+\bid\b\s*=\s*\?/i', $sql);
+        $isSelect = str_starts_with(strtolower(ltrim($sql)), 'select');
+        $hasWhereBinding = (bool) preg_match('/\bwhere\b.+\=\s*\?/i', $sql);
+        $looksLikeRelationLoad = (bool) preg_match('/\bwhere\b.+(?:_id|id)\b\s*=\s*\?/i', $sql);
+        $looksLikeSingleRow = $isSelect && $hasWhereBinding && $looksLikeRelationLoad;
 
         $suspected = $repetition >= $threshold && $looksLikeSingleRow;
 

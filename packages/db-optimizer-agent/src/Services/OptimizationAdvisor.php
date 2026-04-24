@@ -68,15 +68,17 @@ class OptimizationAdvisor
         }
 
         if ((bool) Arr::get($metric, 'detectors.n_plus_one.is_suspected', false)) {
+            $optimizedNPlusOne = $this->rewriteNPlusOneLaravel($currentLaravel);
+
             $recommendations[] = $this->make(
                 'Resolve N+1 via eager loading',
                 'Repeated single-row relation queries detected.',
                 '-- repeated relation query pattern --',
                 "Model::query()->with(['relationName'])->get();",
-                98,
+                120,
                 false,
                 currentLaravel: $currentLaravel,
-                optimizedLaravel: $this->rewriteNPlusOneLaravel($currentLaravel),
+                optimizedLaravel: $optimizedNPlusOne,
             );
         }
 
@@ -281,11 +283,113 @@ SQL;
             return "// N+1 hint\nModel::query()->with(['relationName'])->get();";
         }
 
-        if (str_contains($currentLaravel, '->get()') && ! str_contains($currentLaravel, '->with(')) {
-            return str_replace('->get()', "->with(['relationName'])->get()", $currentLaravel);
+        $lines = preg_split('/\R/', $currentLaravel) ?: [];
+
+        if ($lines === []) {
+            return "// N+1 hint\nModel::query()->with(['relationName'])->get();";
         }
 
-        return "// Add eager loading in the base query\n".$currentLaravel;
+        $relationsByVar = [];
+        $removeIndexes = [];
+
+        foreach ($lines as $i => $line) {
+            if (preg_match('/^\s*\$(\w+)->([a-zA-Z_][\w]*)\s*;\s*(?:\/\/.*)?$/', $line, $m)) {
+                $var = $m[1];
+                $relation = $m[2];
+
+                if (! isset($relationsByVar[$var])) {
+                    $relationsByVar[$var] = [];
+                }
+
+                if (! in_array($relation, $relationsByVar[$var], true)) {
+                    $relationsByVar[$var][] = $relation;
+                }
+
+                $removeIndexes[] = $i;
+            }
+        }
+
+        if ($relationsByVar === []) {
+            if (str_contains($currentLaravel, '->get()') && ! str_contains($currentLaravel, '->with(')) {
+                return str_replace('->get()', "->with(['relationName'])->get()", $currentLaravel);
+            }
+
+            return "// Add eager loading in the base query\n".$currentLaravel;
+        }
+
+        $filtered = [];
+
+        foreach ($lines as $i => $line) {
+            if (! in_array($i, $removeIndexes, true)) {
+                $filtered[] = $line;
+            }
+        }
+
+        foreach ($relationsByVar as $var => $relations) {
+            $filtered = $this->injectWithForVariable($filtered, (string) $var, (array) $relations);
+        }
+
+        return implode("\n", $filtered);
+    }
+
+    /**
+     * @param  array<int, string>  $lines
+     * @param  array<int, string>  $relations
+     * @return array<int, string>
+     */
+    private function injectWithForVariable(array $lines, string $var, array $relations): array
+    {
+        if ($relations === []) {
+            return $lines;
+        }
+
+        $withCode = count($relations) === 1
+            ? "->with('{$relations[0]}')"
+            : "->with(['".implode("', '", $relations)."'])";
+
+        $count = count($lines);
+
+        for ($i = 0; $i < $count; $i++) {
+            if (! preg_match('/\$'.preg_quote($var, '/').'\s*=\s*/', $lines[$i])) {
+                continue;
+            }
+
+            $start = $i;
+            $end = $i;
+
+            while ($end < $count - 1 && ! str_contains($lines[$end], ';')) {
+                $end++;
+            }
+
+            $block = implode("\n", array_slice($lines, $start, $end - $start + 1));
+
+            if (str_contains($block, '->with(')) {
+                continue;
+            }
+
+            if ($start === $end) {
+                $updated = preg_replace('/->(first|get|paginate\s*\([^;]*\))\s*;/', $withCode.'->$1;', $lines[$start]);
+
+                if (is_string($updated) && $updated !== $lines[$start]) {
+                    $lines[$start] = $updated;
+                }
+
+                continue;
+            }
+
+            for ($j = $start; $j <= $end; $j++) {
+                if (preg_match('/->(first|get|paginate\s*\([^\)]*\))\s*;/', $lines[$j])) {
+                    preg_match('/^(\s*)/', $lines[$j], $indentMatch);
+                    $indent = $indentMatch[1] ?? '    ';
+                    array_splice($lines, $j, 0, [$indent.$withCode]);
+                    $count++;
+                    $end++;
+                    break;
+                }
+            }
+        }
+
+        return $lines;
     }
 
     private function buildLaravelBuilderFromSql(string $sql): string
