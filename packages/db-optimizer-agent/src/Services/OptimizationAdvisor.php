@@ -7,6 +7,10 @@ use Illuminate\Support\Arr;
 
 class OptimizationAdvisor
 {
+    public function __construct(
+        private readonly SourceCodeOptimizer $codeOptimizer,
+    ) {}
+
     /**
      * @param  array<string, mixed>  $metric
      * @return array<int, array<string, mixed>>
@@ -23,14 +27,16 @@ class OptimizationAdvisor
         $sourceCurrent   = trim((string) Arr::get($metric, 'source_code.current', ''));
 
         // ── N+1 detection ──────────────────────────────────────────────────────
-        $nPlusOneDetected  = (bool) Arr::get($metric, 'detectors.n_plus_one.is_suspected', false);
-        $repetition        = (int)  Arr::get($metric, 'detectors.n_plus_one.repetition', 1);
+        $nPlusOneDetected = (bool) Arr::get($metric, 'detectors.n_plus_one.is_suspected', false);
+        $repetition       = (int)  Arr::get($metric, 'detectors.n_plus_one.repetition', 1);
 
         if ($nPlusOneDetected) {
-            $recommendations[] = $this->buildNPlusOneRecommendation($event->sql, $rawSql, $sourceCurrent, $repetition, $metric);
+            $recommendations[] = $this->buildNPlusOneRecommendation(
+                $event->sql, $rawSql, $sourceCurrent, $repetition, $metric
+            );
         }
 
-        // Only run other checks when this query is NOT an N+1 repeated fetch
+        // Skip other checks for N+1 repeated queries (they are noise)
         if (! $nPlusOneDetected) {
             $currentLaravel = $sourceCurrent !== ''
                 ? $sourceCurrent
@@ -38,16 +44,25 @@ class OptimizationAdvisor
 
             // ── SELECT * ──────────────────────────────────────────────────────
             if (str_starts_with($normalizedSql, 'select') && str_contains($normalizedSql, 'select *')) {
-                $optimized = preg_replace('/\bselect\s+\*/i', 'SELECT id /* add required columns */', $rawSql) ?? $rawSql;
+                [$optimizedLaravel, $changed] = $this->codeOptimizer->rewrite($currentLaravel);
+
+                // If SourceCodeOptimizer rewrote the function (N+1 fix + select hint), use that.
+                // Otherwise fall back to a simple select column hint.
+                if (! $changed) {
+                    $optimizedLaravel = $this->optimizeSelectAllLaravel($currentLaravel);
+                }
+
+                $optimizedSql = preg_replace('/\bselect\s+\*/i', 'SELECT id, name /* add required columns */', $rawSql) ?? $rawSql;
+
                 $recommendations[] = $this->make(
                     'Select only needed columns',
-                    'Avoid SELECT * to reduce IO and memory.',
+                    'Avoid SELECT * — specify only the columns your view actually uses to reduce IO and memory.',
                     $rawSql,
-                    $optimized,
+                    $optimizedSql,
                     92,
                     true,
                     currentLaravel: $currentLaravel,
-                    optimizedLaravel: $this->optimizeSelectAllLaravel($currentLaravel),
+                    optimizedLaravel: $optimizedLaravel,
                 );
             }
 
@@ -56,7 +71,7 @@ class OptimizationAdvisor
                 $optimized = preg_replace('/\bexists\s*\(\s*select\s+\*/i', 'EXISTS (SELECT 1', $rawSql) ?? $rawSql;
                 $recommendations[] = $this->make(
                     'Use SELECT 1 inside EXISTS',
-                    'EXISTS checks row presence only; selecting columns is unnecessary.',
+                    'EXISTS checks row presence only; selecting columns wastes resources.',
                     $rawSql,
                     $optimized,
                     86,
@@ -64,18 +79,17 @@ class OptimizationAdvisor
                     currentLaravel: $currentLaravel,
                     optimizedLaravel: str_contains($currentLaravel, '->exists()')
                         ? $currentLaravel
-                        : "// Prefer exists() for presence checks\n".$currentLaravel,
+                        : "// Prefer ->exists() for presence checks\n" . $currentLaravel,
                 );
             }
 
             // ── COUNT → EXISTS ─────────────────────────────────────────────────
             if (str_starts_with($normalizedSql, 'select count(')) {
-                $optimized = $this->rewriteCountToExists($rawSql);
                 $recommendations[] = $this->make(
                     'Use EXISTS instead of COUNT when checking presence',
-                    'For boolean checks, EXISTS can stop at first match and is usually cheaper.',
+                    'For boolean checks, EXISTS stops at the first match and is faster than COUNT.',
                     $rawSql,
-                    $optimized,
+                    $this->rewriteCountToExists($rawSql),
                     88,
                     true,
                     currentLaravel: $currentLaravel,
@@ -84,25 +98,24 @@ class OptimizationAdvisor
             }
 
             // ── Missing indexes ────────────────────────────────────────────────
-            if (! empty(Arr::get($metric, 'detectors.missing_indexes', []))) {
-                $first  = Arr::first((array) Arr::get($metric, 'detectors.missing_indexes', []));
+            $missingIndexes = (array) Arr::get($metric, 'detectors.missing_indexes', []);
+            if (! empty($missingIndexes)) {
+                $first  = Arr::first($missingIndexes);
                 $table  = is_array($first) ? (string) ($first['table']  ?? 'table_name')  : 'table_name';
                 $column = is_array($first) ? (string) ($first['column'] ?? 'column_name') : 'column_name';
 
                 if ($table !== '' && $column !== '' && strtolower($column) !== 'id') {
-                    $idxName    = $this->safeIndexName($table, $column);
-                    $guardedSql = $this->buildGuardedIndexSql($table, $column, $idxName);
-
+                    $idxName = $this->safeIndexName($table, $column);
                     $recommendations[] = $this->make(
                         'Add index for filter/join column',
-                        "Missing leading index on `{$table}`.`{$column}`. Run the guarded SQL below; it skips safely if the index already exists.",
+                        "No leading index found on `{$table}`.`{$column}`. Run the guarded migration below — safe to run multiple times.",
                         $rawSql,
                         "ALTER TABLE `{$table}` ADD INDEX `{$idxName}` (`{$column}`);",
                         95,
                         false,
-                        executableSql: $guardedSql,
+                        executableSql: $this->buildGuardedIndexSql($table, $column, $idxName),
                         currentLaravel: $currentLaravel,
-                        optimizedLaravel: "// Keep the application query as-is; add the index in MySQL.\n// Run the 'Executable SQL (Safe/Guarded)' block below in your DB client or migration.",
+                        optimizedLaravel: "// Add to a new migration:\nSchema::table('{$table}', function (Blueprint \$table) {\n    \$table->index('{$column}');\n});",
                     );
                 }
             }
@@ -111,7 +124,7 @@ class OptimizationAdvisor
             if ((bool) Arr::get($metric, 'detectors.cache_candidate.is_candidate', false)) {
                 $recommendations[] = $this->make(
                     'Cache repeated read query',
-                    'Static repeated SELECT detected with identical bindings.',
+                    'This SELECT ran multiple times with identical bindings — a great cache candidate.',
                     $rawSql,
                     "Cache::remember('db-opt-key', 300, fn () => DB::select(\"{$this->escapeForPhpString($event->sql)}\"));",
                     84,
@@ -125,23 +138,24 @@ class OptimizationAdvisor
             if (str_contains($normalizedSql, ' offset ')) {
                 $recommendations[] = $this->make(
                     'Prefer keyset pagination over OFFSET',
-                    'Large OFFSET values degrade performance on big datasets.',
+                    'Large OFFSET scans rows before discarding them. Use cursor/keyset pagination for big tables.',
                     $rawSql,
-                    'SELECT ... WHERE id < :last_seen_id ORDER BY id DESC LIMIT 12',
+                    "SELECT ... WHERE id < :last_seen_id ORDER BY id DESC LIMIT :per_page",
                     76,
                     false,
                     currentLaravel: $currentLaravel,
-                    optimizedLaravel: "// Keyset pagination example\nDB::table('table_name')\n    ->where('id', '<', \$lastSeenId)\n    ->orderByDesc('id')\n    ->limit(12)\n    ->get();",
+                    optimizedLaravel: "// Keyset (cursor) pagination\n\$items = Model::where('id', '<', \$lastSeenId)\n    ->orderByDesc('id')\n    ->limit(15)\n    ->get();",
                 );
             }
 
-            // ── Slow query EXPLAIN hint ────────────────────────────────────────
+            // ── Slow query (EXPLAIN) ───────────────────────────────────────────
             if (isset($metric['explain'])) {
+                $summary = (string) ($metric['explain']['summary'] ?? '');
                 $recommendations[] = $this->make(
                     'Tune query based on EXPLAIN',
-                    'Slow query plan indicates scan/sort bottlenecks. '.(string)($metric['explain']['summary'] ?? ''),
+                    "Slow query plan detected. {$summary}",
                     $rawSql,
-                    '-- add/selective indexes on WHERE + JOIN columns; avoid filesort/temporary --',
+                    '-- Add indexes on WHERE + JOIN columns; avoid filesort and temporary tables.',
                     93,
                     false,
                     currentLaravel: $currentLaravel,
@@ -150,15 +164,8 @@ class OptimizationAdvisor
             }
         }
 
-        foreach ($recommendations as &$recommendation) {
-            if ((bool) config('db_optimizer.auto_apply_safe_optimizations', false) && ($recommendation['safe_auto_apply'] ?? false)) {
-                $recommendation['auto_apply_eligible'] = true;
-                $recommendation['auto_applied']        = false;
-            }
-        }
-        unset($recommendation);
-
-        usort($recommendations, static fn (array $a, array $b): int => ((int) ($b['priority'] ?? 0)) <=> ((int) ($a['priority'] ?? 0)));
+        // Sort by priority
+        usort($recommendations, static fn ($a, $b) => ((int) ($b['priority'] ?? 0)) <=> ((int) ($a['priority'] ?? 0)));
 
         return array_slice($recommendations, 0, max(1, (int) config('db_optimizer.recommendation_limit', 8)));
     }
@@ -167,14 +174,7 @@ class OptimizationAdvisor
     // N+1 recommendation builder
     // ──────────────────────────────────────────────────────────────────────────
 
-    /**
-     * Build a meaningful N+1 recommendation.
-     * Shows:  [Current]   – the actual repeated SQL being fired
-     *         [Optimized] – a concrete eager-loading rewrite
-     *
-     * @param  array<string, mixed>  $metric
-     * @return array<string, mixed>
-     */
+    /** @param array<string, mixed> $metric */
     private function buildNPlusOneRecommendation(
         string $sql,
         string $rawSql,
@@ -182,30 +182,28 @@ class OptimizationAdvisor
         int $repetition,
         array $metric,
     ): array {
-        // Extract table and relation hint from the repeated SQL
         $table    = $this->extractTableFromSql($sql);
         $relation = $this->guessRelationName($sql, $table);
         $idColumn = $this->extractWhereIdColumn($sql);
 
-        // ── Current: show the actual repeated query ───────────────────────────
-        $currentSqlDisplay = $rawSql;
-
-        // ── Current Laravel: show source if available, else meaningful pseudo-code
+        // ── If we have source code, do a FULL intelligent rewrite ─────────────
         if ($sourceCurrent !== '') {
-            $currentLaravel = $sourceCurrent;
+            [$rewritten, $changed] = $this->codeOptimizer->rewrite($sourceCurrent);
+
+            $optimizedLaravel = $changed
+                ? "// ✅ Optimized — all lazy relations eager-loaded, N+1 eliminated\n{$rewritten}"
+                : $this->buildNPlusOneOptimizedLaravel('', $table, $relation);
         } else {
-            $currentLaravel = $this->buildNPlusOneCurrentLaravel($table, $relation, $idColumn, $repetition);
+            $optimizedLaravel = $this->buildNPlusOneOptimizedLaravel('', $table, $relation);
         }
 
-        // ── Optimized Laravel: proper eager loading ───────────────────────────
-        $optimizedLaravel = $this->buildNPlusOneOptimizedLaravel($sourceCurrent, $table, $relation);
-
-        // ── Optimized SQL: single JOIN-based query ─────────────────────────────
-        $optimizedSql = $this->buildNPlusOneOptimizedSql($sql, $table, $relation, $idColumn);
+        $currentLaravel = $sourceCurrent !== ''
+            ? $sourceCurrent
+            : $this->buildNPlusOneCurrentLaravel($table, $relation, $idColumn, $repetition);
 
         $description = sprintf(
-            'This query ran %d times in this request — typical N+1 pattern. '
-            .'Instead of fetching `%s` rows one by one inside a loop, load all related records at once using eager loading.',
+            'Query ran %d× in this request — classic N+1. '
+            . 'Each iteration fires a new SELECT instead of loading all related `%s` records at once.',
             $repetition,
             $table ?: 'related',
         );
@@ -213,8 +211,8 @@ class OptimizationAdvisor
         return $this->make(
             'Resolve N+1 via eager loading',
             $description,
-            $currentSqlDisplay,
-            $optimizedSql,
+            $rawSql,
+            $this->buildNPlusOneOptimizedSql($sql, $table, $idColumn),
             120,
             false,
             currentLaravel: $currentLaravel,
@@ -222,103 +220,60 @@ class OptimizationAdvisor
         );
     }
 
-    /**
-     * Build a "current" Laravel pseudo-code block showing the N+1 pattern.
-     */
-    private function buildNPlusOneCurrentLaravel(
-        string $table,
-        string $relation,
-        string $idColumn,
-        int $repetition,
-    ): string {
-        $model      = $this->tableToModelName($table);
-        $parentModel = 'Post'; // generic parent guess
+    private function buildNPlusOneCurrentLaravel(string $table, string $relation, string $idColumn, int $repetition): string
+    {
+        $parent = 'Post';
 
         return <<<PHP
-// ⚠ N+1 detected — query ran {$repetition}× in this request
-\$items = {$parentModel}::all(); // loads N parent records
+// ⚠ N+1 detected — this query ran {$repetition}× in one request
+\$items = {$parent}::all(); // loads N parent records
 
 foreach (\$items as \$item) {
-    \$item->{$relation}; // fires a new SELECT every iteration!
-    // SELECT * FROM `{$table}` WHERE `{$idColumn}` = ?
+    \$item->{$relation}; // ← fires a new SELECT per iteration!
+    // Actual query: SELECT * FROM `{$table}` WHERE `{$idColumn}` = ?
 }
 PHP;
     }
 
-    /**
-     * Build an optimized Laravel eager-loading block.
-     */
-    private function buildNPlusOneOptimizedLaravel(
-        string $sourceCurrent,
-        string $table,
-        string $relation,
-    ): string {
-        $model      = $this->tableToModelName($table);
-        $parentModel = 'Post';
-
-        // If we have real source code, try to inject ->with()
-        if ($sourceCurrent !== '') {
-            $rewritten = $this->injectEagerLoading($sourceCurrent, $relation);
-            if ($rewritten !== $sourceCurrent) {
-                return "// ✅ Optimized: eager load `{$relation}` to avoid N+1\n".$rewritten;
-            }
-        }
+    private function buildNPlusOneOptimizedLaravel(string $sourceCurrent, string $table, string $relation): string
+    {
+        $parent = 'Post';
 
         return <<<PHP
-// ✅ Optimized: load all related `{$table}` records in ONE query
-\$items = {$parentModel}::with('{$relation}')->get();
+// ✅ Optimized — 1 query instead of N
+\$items = {$parent}::with('{$relation}')->get();
 
 foreach (\$items as \$item) {
-    \$item->{$relation}; // already loaded — no extra query fired
+    \$item->{$relation}; // already loaded — zero extra queries
 }
 PHP;
     }
 
-    /**
-     * Build a single optimized SQL for N+1 (JOIN-based).
-     */
-    private function buildNPlusOneOptimizedSql(
-        string $sql,
-        string $table,
-        string $relation,
-        string $idColumn,
-    ): string {
-        // Try to extract parent table from WHERE column e.g. post_id → posts
+    private function buildNPlusOneOptimizedSql(string $sql, string $table, string $idColumn): string
+    {
         $parentTable = $this->guessParentTable($idColumn);
 
         if ($parentTable && $table) {
-            return "-- Single query replaces N+{1} repeated queries\n"
-                ."SELECT `{$parentTable}`.*, `{$table}`.*\n"
-                ."FROM `{$parentTable}`\n"
-                ."LEFT JOIN `{$table}` ON `{$table}`.`{$idColumn}` = `{$parentTable}`.`id`\n"
-                ."WHERE `{$parentTable}`.`id` IN (/* your parent IDs */);";
+            return "-- Replace N repeated queries with ONE\n"
+                . "SELECT `{$table}`.*\n"
+                . "FROM `{$table}`\n"
+                . "WHERE `{$idColumn}` IN (/* parent IDs from first query */);";
         }
 
-        if ($table) {
-            return "-- Load all related records at once\n"
-                ."SELECT * FROM `{$table}`\n"
-                ."WHERE `{$idColumn}` IN (/* parent IDs from first query */);";
-        }
-
-        return '-- Use eager loading: load related records in a single WHERE IN query';
+        return "SELECT * FROM `{$table}` WHERE `{$idColumn}` IN (/* parent IDs */);";
     }
 
     // ──────────────────────────────────────────────────────────────────────────
-    // SQL helpers
+    // SQL analysis helpers
     // ──────────────────────────────────────────────────────────────────────────
 
     private function extractTableFromSql(string $sql): string
     {
-        if (preg_match('/\bfrom\s+`?([a-zA-Z_][\w]*)`?/i', $sql, $m)) {
-            return $m[1];
-        }
-
-        return '';
+        return preg_match('/\bfrom\s+`?([a-zA-Z_][\w]*)`?/i', $sql, $m) ? $m[1] : '';
     }
 
     private function extractWhereIdColumn(string $sql): string
     {
-        // e.g. WHERE `post_id` = ? or WHERE id = ?
         if (preg_match('/\bwhere\b.+?`?([a-zA-Z_][\w]*(?:_id|id))`?\s*=\s*\?/i', $sql, $m)) {
             return $m[1];
         }
@@ -328,61 +283,176 @@ PHP;
 
     private function guessRelationName(string $sql, string $table): string
     {
-        // Derive from WHERE column: post_id → post (singular relation)
         $idCol = $this->extractWhereIdColumn($sql);
 
         if ($idCol !== 'id' && str_ends_with(strtolower($idCol), '_id')) {
-            return substr($idCol, 0, -3); // strip _id
+            return substr($idCol, 0, -3);
         }
 
-        // Fall back to table name singular
         return $table ? rtrim($table, 's') : 'relation';
     }
 
     private function guessParentTable(string $idColumn): string
     {
-        // post_id → posts
         if (str_ends_with(strtolower($idColumn), '_id')) {
-            return substr($idColumn, 0, -3).'s';
+            return substr($idColumn, 0, -3) . 's';
         }
 
         return '';
     }
 
-    private function tableToModelName(string $table): string
-    {
-        // users → User, blog_posts → BlogPost
-        $parts = explode('_', $table);
-        $parts = array_map('ucfirst', $parts);
-        $name  = implode('', $parts);
+    // ──────────────────────────────────────────────────────────────────────────
+    // Laravel builder helpers
+    // ──────────────────────────────────────────────────────────────────────────
 
-        // Naive singular: strip trailing 's' if present
-        return rtrim($name, 's') ?: 'Model';
-    }
-
-    /**
-     * Inject ->with('relation') into real source code if possible.
-     */
-    private function injectEagerLoading(string $source, string $relation): string
+    private function optimizeSelectAllLaravel(string $src): string
     {
-        // Already has eager loading
-        if (str_contains($source, '->with(')) {
-            return $source;
+        if ($src === '') {
+            return $src;
         }
 
-        foreach (['->get()', '->first()', '->paginate('] as $terminal) {
-            if (str_contains($source, $terminal)) {
-                $withCode = "->with('{$relation}')";
+        foreach (["->select('*')", '->get()', '->first()', '->paginate('] as $terminal) {
+            if (str_contains($src, $terminal)) {
+                $hint = "->select(['id' /* add required columns */])";
 
-                return str_replace($terminal, $withCode.$terminal, $source);
+                return str_replace(
+                    $terminal,
+                    $terminal === "->select('*')" ? "->select(['id' /* add columns */])" : "{$hint}\n    {$terminal}",
+                    $src,
+                );
             }
         }
 
-        return $source;
+        return $src;
+    }
+
+    private function rewriteLaravelCountToExists(string $src): string
+    {
+        if (str_contains($src, '->count()')) {
+            return str_replace('->count();', '->exists();', $src);
+        }
+
+        return "// Use ->exists() for presence checks\n" . $src;
+    }
+
+    private function rewriteCountToExists(string $sql): string
+    {
+        $fromPos = strpos(strtolower($sql), ' from ');
+
+        if ($fromPos === false) {
+            return 'SELECT EXISTS(SELECT 1 FROM your_table WHERE ...) AS `exists_flag`';
+        }
+
+        return 'SELECT EXISTS(SELECT 1 FROM ' . substr($sql, $fromPos + 6) . ' LIMIT 1) AS `exists_flag`';
     }
 
     // ──────────────────────────────────────────────────────────────────────────
-    // Helpers shared across recommendations
+    // SQL → Laravel builder (fallback when no source code available)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    private function buildLaravelBuilderFromSql(string $sql): string
+    {
+        $flat = preg_replace('/\s+/', ' ', trim($sql)) ?? trim($sql);
+
+        if (! str_starts_with(strtolower($flat), 'select ')) {
+            return 'DB::statement("' . addslashes($flat) . '");';
+        }
+
+        if (! preg_match('/select\s+(.+?)\s+from\s+`?([a-zA-Z_][\w]*)`?/i', $flat, $m)) {
+            return 'DB::select("' . addslashes($flat) . '");';
+        }
+
+        $selectRaw = trim($m[1] ?? '*');
+        $table     = $m[2] ?? 'table_name';
+        $lines     = ["DB::table('{$table}')"];
+
+        // JOINs
+        preg_match_all('/\bjoin\s+`?([a-zA-Z_][\w]*)`?\s+on\s+([^\s]+)\s*=\s*([^\s]+)/i', $flat, $joins, PREG_SET_ORDER);
+        foreach ($joins as $j) {
+            $lines[] = "    ->join('{$j[1]}', '" . trim($j[2], '` ') . "', '=', '" . trim($j[3], '` ') . "')";
+        }
+
+        // WHEREs
+        if (preg_match('/\bwhere\b\s+(.+?)(?:\border\s+by\b|\blimit\b|\boffset\b|$)/i', $flat, $wp)) {
+            foreach (preg_split('/\s+and\s+/i', trim($wp[1])) ?: [] as $cond) {
+                if (preg_match('/`?([a-zA-Z_][\w\.]+)`?\s*(=|>=|<=|>|<|!=)\s*(.+)$/i', trim($cond), $c)) {
+                    $lines[] = "    ->where('" . trim($c[1], '` ') . "', '{$c[2]}', " . $this->toPhpLiteral(trim($c[3])) . ")";
+                }
+            }
+        }
+
+        // ORDER BY
+        if (preg_match('/\border\s+by\s+`?([a-zA-Z_][\w\.]*)`?\s*(asc|desc)?/i', $flat, $o)) {
+            $dir = strtolower($o[2] ?? 'asc');
+            $lines[] = $dir === 'desc' ? "    ->orderByDesc('" . trim($o[1], '` ') . "')" : "    ->orderBy('" . trim($o[1], '` ') . "')";
+        }
+
+        // SELECT columns
+        if ($selectRaw === '*') {
+            $lines[] = "    ->select('*')";
+        } else {
+            $cols    = array_filter(array_map(static fn ($c) => trim(trim($c), '`'), explode(',', $selectRaw)));
+            $colsPhp = implode(', ', array_map(static fn ($c) => "'{$c}'", $cols));
+            $lines[] = "    ->select([{$colsPhp}])";
+        }
+
+        // LIMIT
+        if (preg_match('/\blimit\s+(\d+)/i', $flat, $lm)) {
+            $lines[] = '    ->limit(' . (int) $lm[1] . ')';
+        }
+
+        return implode("\n", $lines) . "\n    ->get();";
+    }
+
+    private function toPhpLiteral(string $v): string
+    {
+        if ($v === '?') return '$value';
+        if (is_numeric($v)) return $v;
+        if (strtolower(trim($v, "'\"")) === 'null') return 'null';
+        return "'" . addslashes(trim($v, "'\"")) . "'";
+    }
+
+    private function escapeForPhpString(string $sql): string
+    {
+        return str_replace(['\\', '"'], ['\\\\', '\\"'], $sql);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Index helpers
+    // ──────────────────────────────────────────────────────────────────────────
+
+    private function safeIndexName(string $table, string $column): string
+    {
+        return 'idx_' . preg_replace('/[^a-zA-Z0-9_]+/', '_', $table . '_' . $column);
+    }
+
+    private function buildGuardedIndexSql(string $table, string $column, string $indexName): string
+    {
+        $te = str_replace("'", "''", $table);
+        $ce = str_replace("'", "''", $column);
+
+        return <<<SQL
+-- Safe to run multiple times
+SET @dbopt_idx_exists := (
+    SELECT COUNT(1) FROM information_schema.statistics
+    WHERE table_schema = DATABASE()
+      AND table_name   = '{$te}'
+      AND column_name  = '{$ce}'
+      AND seq_in_index = 1
+);
+SET @dbopt_stmt := IF(
+    @dbopt_idx_exists = 0,
+    'ALTER TABLE `{$table}` ADD INDEX `{$indexName}` (`{$column}`)',
+    'SELECT "skip: index already exists for {$table}.{$column}"'
+);
+PREPARE dbopt_query FROM @dbopt_stmt;
+EXECUTE dbopt_query;
+DEALLOCATE PREPARE dbopt_query;
+SQL;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Shared
     // ──────────────────────────────────────────────────────────────────────────
 
     private function normalizeSql(string $sql): string
@@ -390,23 +460,7 @@ PHP;
         return preg_replace('/\s+/', ' ', strtolower(trim($sql))) ?? strtolower(trim($sql));
     }
 
-    private function rewriteCountToExists(string $sql): string
-    {
-        $normalized = strtolower($sql);
-        $fromPos    = strpos($normalized, ' from ');
-
-        if ($fromPos === false) {
-            return 'SELECT EXISTS(SELECT 1 FROM your_table WHERE ...) AS exists_flag';
-        }
-
-        $tail = substr($sql, $fromPos + 6);
-
-        return 'SELECT EXISTS(SELECT 1 FROM '.$tail.' LIMIT 1) AS exists_flag';
-    }
-
-    /**
-     * @return array<string, mixed>
-     */
+    /** @return array<string, mixed> */
     private function make(
         string $title,
         string $description,
@@ -414,199 +468,21 @@ PHP;
         string $optimizedSql,
         int $priority,
         bool $safeAutoApply,
-        ?string $executableSql = null,
-        ?string $currentLaravel = null,
+        ?string $executableSql   = null,
+        ?string $currentLaravel  = null,
         ?string $optimizedLaravel = null,
     ): array {
         return [
-            'title'              => $title,
-            'description'        => $description,
-            'current_sql'        => $currentSql,
-            'optimized_sql'      => $optimizedSql,
-            'executable_sql'     => $executableSql,
-            'current_laravel'    => $currentLaravel,
-            'optimized_laravel'  => $optimizedLaravel,
-            'priority'           => $priority,
-            'safe_auto_apply'    => $safeAutoApply,
-            'auto_apply_eligible'=> false,
+            'title'               => $title,
+            'description'         => $description,
+            'current_sql'         => $currentSql,
+            'optimized_sql'       => $optimizedSql,
+            'executable_sql'      => $executableSql,
+            'current_laravel'     => $currentLaravel,
+            'optimized_laravel'   => $optimizedLaravel,
+            'priority'            => $priority,
+            'safe_auto_apply'     => $safeAutoApply,
+            'auto_apply_eligible' => false,
         ];
-    }
-
-    private function safeIndexName(string $table, string $column): string
-    {
-        return 'idx_'.preg_replace('/[^a-zA-Z0-9_]+/', '_', $table.'_'.$column);
-    }
-
-    private function buildGuardedIndexSql(string $table, string $column, string $indexName): string
-    {
-        $tableEsc  = str_replace("'", "''", $table);
-        $columnEsc = str_replace("'", "''", $column);
-
-        return <<<SQL
--- Safe to run multiple times on MySQL
-SET @dbopt_idx_exists := (
-    SELECT COUNT(1)
-    FROM information_schema.statistics
-    WHERE table_schema = DATABASE()
-      AND table_name = '{$tableEsc}'
-      AND column_name = '{$columnEsc}'
-      AND seq_in_index = 1
-);
-
-SET @dbopt_stmt := IF(
-    @dbopt_idx_exists = 0,
-    'ALTER TABLE `{$table}` ADD INDEX `{$indexName}` (`{$column}`)',
-    'SELECT "skip: index already exists for {$table}.{$column}"'
-);
-
-PREPARE dbopt_query FROM @dbopt_stmt;
-EXECUTE dbopt_query;
-DEALLOCATE PREPARE dbopt_query;
-SQL;
-    }
-
-    private function optimizeSelectAllLaravel(string $currentLaravel): string
-    {
-        if ($currentLaravel === '') {
-            return $currentLaravel;
-        }
-
-        if (str_contains($currentLaravel, "->select('*')")) {
-            return str_replace("->select('*')", "->select(['id']) // add required columns", $currentLaravel);
-        }
-
-        if (! str_contains($currentLaravel, '->select(')) {
-            if (str_contains($currentLaravel, '->first()')) {
-                return str_replace('->first()', "->select(['id']) // add required columns\n    ->first()", $currentLaravel);
-            }
-
-            if (str_contains($currentLaravel, '->paginate(')) {
-                return preg_replace('/->paginate\(([^\)]*)\)/', "->select(['id']) // add required columns\n    ->paginate($1)", $currentLaravel) ?? $currentLaravel;
-            }
-
-            if (str_contains($currentLaravel, '->get()')) {
-                return str_replace('->get()', "->select(['id']) // add required columns\n    ->get()", $currentLaravel);
-            }
-        }
-
-        return $currentLaravel;
-    }
-
-    private function rewriteLaravelCountToExists(string $currentLaravel): string
-    {
-        if ($currentLaravel === '') {
-            return $currentLaravel;
-        }
-
-        if (str_contains($currentLaravel, '->count()')) {
-            return str_replace('->count();', '->exists();', $currentLaravel);
-        }
-
-        return "// Use exists() if checking only presence\n".$currentLaravel;
-    }
-
-    private function buildLaravelBuilderFromSql(string $sql): string
-    {
-        $flatSql = preg_replace('/\s+/', ' ', trim($sql)) ?? trim($sql);
-
-        if (! str_starts_with(strtolower($flatSql), 'select ')) {
-            return 'DB::statement("'.addslashes($flatSql).'");';
-        }
-
-        if (! preg_match('/select\s+(.+?)\s+from\s+`?([a-zA-Z_][\w]*)`?/i', $flatSql, $selectAndFrom)) {
-            return 'DB::select("'.addslashes($flatSql).'");';
-        }
-
-        $selectRaw = trim($selectAndFrom[1] ?? '*');
-        $table     = $selectAndFrom[2] ?? 'table_name';
-        $builder   = ["DB::table('{$table}')"];
-
-        $joins = [];
-        preg_match_all('/\bjoin\s+`?([a-zA-Z_][\w]*)`?\s+on\s+([^\s]+)\s*=\s*([^\s]+)(?:\s|$)/i', $flatSql, $joinMatches, PREG_SET_ORDER);
-        foreach ($joinMatches as $join) {
-            $joinTable = $join[1] ?? null;
-            $left      = isset($join[2]) ? trim($join[2], '` ') : null;
-            $right     = isset($join[3]) ? trim($join[3], '` ') : null;
-
-            if ($joinTable && $left && $right) {
-                $joins[] = "    ->join('{$joinTable}', '{$left}', '=', '{$right}')";
-            }
-        }
-
-        $whereChains = [];
-        if (preg_match('/\bwhere\b\s+(.+?)(?:\border\s+by\b|\blimit\b|\boffset\b|$)/i', $flatSql, $wherePart)) {
-            $whereExpr  = trim($wherePart[1] ?? '');
-            $conditions = preg_split('/\s+and\s+/i', $whereExpr) ?: [];
-
-            foreach ($conditions as $condition) {
-                if (preg_match('/`?([a-zA-Z_][\w\.]+)`?\s*(=|>=|<=|>|<|!=|<>)\s*(.+)$/i', trim($condition), $c)) {
-                    $column      = trim($c[1], '` ');
-                    $operator    = $c[2] ?? '=';
-                    $value       = trim($c[3] ?? '?', ' ');
-                    $whereChains[] = "    ->where('{$column}', '{$operator}', {$this->toPhpLiteral($value)})";
-                }
-            }
-        }
-
-        if (! empty($joins)) {
-            $builder = array_merge($builder, $joins);
-        }
-
-        if (! empty($whereChains)) {
-            $builder = array_merge($builder, $whereChains);
-        }
-
-        if (preg_match('/\border\s+by\s+`?([a-zA-Z_][\w\.]*)`?\s*(asc|desc)?/i', $flatSql, $order)) {
-            $orderBy   = trim($order[1] ?? '', '` ');
-            $direction = strtolower($order[2] ?? 'asc');
-            $builder[] = $direction === 'desc'
-                ? "    ->orderByDesc('{$orderBy}')"
-                : "    ->orderBy('{$orderBy}')";
-        }
-
-        if (str_contains(strtolower($flatSql), ' distinct')) {
-            $builder[] = '    ->distinct()';
-        }
-
-        if ($selectRaw === '*') {
-            $builder[] = "    ->select('*')";
-        } else {
-            $columns    = array_map(static fn (string $c): string => trim(trim($c), '`'), explode(',', $selectRaw));
-            $columns    = array_values(array_filter($columns, static fn (string $c): bool => $c !== ''));
-            $columnPhp  = implode(', ', array_map(static fn (string $c): string => "'{$c}'", $columns));
-            $builder[]  = "    ->select([{$columnPhp}])";
-        }
-
-        if (preg_match('/\blimit\s+(\d+)/i', $flatSql, $limit)) {
-            $builder[] = '    ->limit('.(int) ($limit[1] ?? 0).')';
-        }
-
-        return implode("\n", $builder)."\n    ->get();";
-    }
-
-    private function toPhpLiteral(string $value): string
-    {
-        $trimmed = trim($value);
-
-        if ($trimmed === '?') {
-            return '$value';
-        }
-
-        if (is_numeric($trimmed)) {
-            return $trimmed;
-        }
-
-        $trimmed = trim($trimmed, "'\"");
-
-        if (strtolower($trimmed) === 'null') {
-            return 'null';
-        }
-
-        return "'".addslashes($trimmed)."'";
-    }
-
-    private function escapeForPhpString(string $sql): string
-    {
-        return str_replace(['\\', '"'], ['\\\\', '\\"'], $sql);
     }
 }
