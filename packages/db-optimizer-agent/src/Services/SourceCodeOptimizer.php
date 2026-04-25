@@ -53,6 +53,9 @@ class SourceCodeOptimizer
         // ── Phase 5: inject select() hints ────────────────────────────────────
         $lines = $this->injectSelectClauses($lines);
 
+        // ── Phase 6: inject architecture warnings ─────────────────────────────
+        $lines = $this->injectArchitectureWarnings($lines);
+
         $rewritten = implode("\n", $lines);
 
         return [$rewritten, $rewritten !== $source];
@@ -275,9 +278,41 @@ class SourceCodeOptimizer
             if (!$hasSelect) {
                 foreach (['->get(', '->first(', '->paginate(', '->all('] as $term) {
                     if (str_contains($lines[$i], $term)) {
-                        $lines[$i] = str_replace($term, "->select(['id' /* add needed columns */])\n    " . $term, $lines[$i]);
+                        $lines[$i] = str_replace($term, "->select(['id' /* add ALL foreign keys & needed columns */])\n    " . $term, $lines[$i]);
                         break;
                     }
+                }
+            }
+        }
+        return $lines;
+    }
+
+    private function injectArchitectureWarnings(array $lines): array
+    {
+        for ($i = 0; $i < count($lines); $i++) {
+            if (preg_match('/(?:->|::)find\s*\(\s*\$/', $lines[$i])) {
+                $injectLine = $i;
+                for ($j = $i; $j >= max(0, $i - 3); $j--) {
+                    if (preg_match('/=\s*[A-Z][\w\\\\]*::/', $lines[$j])) {
+                        $injectLine = $j;
+                        break;
+                    }
+                }
+                
+                $inLoop = false;
+                for ($j = max(0, $injectLine - 10); $j < $injectLine; $j++) {
+                    if (preg_match('/\b(foreach|while|for)\b/', $lines[$j])) {
+                        $inLoop = true;
+                        break;
+                    }
+                }
+                
+                if ($inLoop) {
+                    preg_match('/^(\s*)/', $lines[$injectLine], $indentM);
+                    $indent = $indentM[1] ?? '        ';
+                    array_splice($lines, $injectLine, 0, [$indent . '// ⚠️ ARCHITECTURE WARNING: Calling find() inside a loop is an N+1 pattern.']);
+                    array_splice($lines, $injectLine + 1, 0, [$indent . '// Consider refactoring to use ->whereIn(\'id\', $ids) outside the loop!']);
+                    $i += 2;
                 }
             }
         }
