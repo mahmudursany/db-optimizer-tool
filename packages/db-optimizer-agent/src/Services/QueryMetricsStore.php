@@ -3,6 +3,7 @@
 namespace Mdj\DbOptimizer\Services;
 
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Storage;
 
 class QueryMetricsStore
@@ -92,13 +93,36 @@ class QueryMetricsStore
             return $q;
         }, $actionable);
 
+        // ── Step 4: Cross-request deduplication (by fingerprint) ──────────────
+        // To avoid bloating the NDJSON with the same issues repeatedly,
+        // we keep track of which fingerprints were already recorded today.
+        $cacheKey = 'db_optimizer_fingerprints_'.now()->format('Y-m-d');
+        $recorded = Cache::get($cacheKey, []);
+        
+        $newQueries = [];
+        foreach ($slim as $q) {
+            $fp = (string) ($q['fingerprint'] ?? '');
+            if ($fp !== '' && ! in_array($fp, $recorded, true)) {
+                $newQueries[] = $q;
+                $recorded[] = $fp;
+            }
+        }
+
+        if ($newQueries === []) {
+            $this->buffer = [];
+            return;
+        }
+
+        // Update cache (expire in 24h)
+        Cache::put($cacheKey, $recorded, now()->addDay());
+
         $disk = (string) config('db_optimizer.storage_disk', 'local');
         $path = trim((string) config('db_optimizer.storage_path', 'db-optimizer'), '/');
 
         $payload = [
             'captured_at' => now()->toIso8601String(),
             'meta'        => $meta,
-            'queries'     => array_values($slim),
+            'queries'     => array_values($newQueries),
         ];
 
         $line = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);

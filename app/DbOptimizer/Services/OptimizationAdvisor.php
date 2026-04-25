@@ -34,11 +34,14 @@ class OptimizationAdvisor
         }
 
         if ((bool) Arr::get($metric, 'detectors.n_plus_one.is_suspected', false)) {
+            $table = preg_match('/\bfrom\s+`?([a-zA-Z_][\w]*)`?/i', $event->sql, $m) ? $m[1] : '';
+            $model = $table ? \Illuminate\Support\Str::studly(\Illuminate\Support\Str::singular($table)) : 'YourModel';
+
             $recommendations[] = $this->makeRecommendation(
                 type: 'eager_loading',
                 title: 'Use eager loading',
                 description: 'The same relation query is repeating. Load relations up front with with() or load().',
-                codeHint: "Post::with(['author', 'comments'])->get()",
+                codeHint: "{$model}::with(['relation_name'])->get()",
                 priority: 100,
                 confidence: 0.97,
                 safeAutoApply: false,

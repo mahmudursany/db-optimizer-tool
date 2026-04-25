@@ -134,7 +134,9 @@ class SourceCodeOptimizer
             foreach ($rels as $rel) {
                 $currentVar = $var;
                 $path       = $rel;
-                while (isset($aliases[$currentVar])) {
+                $visited    = [];
+                while (isset($aliases[$currentVar]) && !isset($visited[$currentVar])) {
+                    $visited[$currentVar] = true;
                     $alias      = $aliases[$currentVar];
                     $path       = $alias['rel'] . '.' . $path;
                     $currentVar = $alias['parent'];
@@ -147,7 +149,9 @@ class SourceCodeOptimizer
             foreach ($rels as $rel) {
                 $currentVar = $col;
                 $path       = $rel;
-                while (isset($aliases[$currentVar])) {
+                $visited    = [];
+                while (isset($aliases[$currentVar]) && !isset($visited[$currentVar])) {
+                    $visited[$currentVar] = true;
                     $alias      = $aliases[$currentVar];
                     $path       = $alias['rel'] . '.' . $path;
                     $currentVar = $alias['parent'];

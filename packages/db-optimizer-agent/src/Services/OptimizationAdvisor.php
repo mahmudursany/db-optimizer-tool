@@ -4,6 +4,8 @@ namespace Mdj\DbOptimizer\Services;
 
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Arr;
+use Illuminate\Support\Str;
+use Illuminate\Support\Facades\Schema;
 
 class OptimizationAdvisor
 {
@@ -32,7 +34,7 @@ class OptimizationAdvisor
 
         if ($nPlusOneDetected) {
             $recommendations[] = $this->buildNPlusOneRecommendation(
-                $event->sql, $rawSql, $sourceCurrent, $repetition, $metric
+                $event, $rawSql, $sourceCurrent, $repetition, $metric
             );
         }
 
@@ -155,15 +157,27 @@ class OptimizationAdvisor
 
     /** @param array<string, mixed> $metric */
     private function buildNPlusOneRecommendation(
-        string $sql,
+        QueryExecuted $event,
         string $rawSql,
         string $sourceCurrent,
         int $repetition,
         array $metric,
     ): array {
-        $table    = $this->extractTableFromSql($sql);
-        $relation = $this->guessRelationName($sql, $table);
-        $idColumn = $this->extractWhereIdColumn($sql);
+        $sql      = $event->sql;
+        $conn     = $event->connectionName;
+        $table    = $this->extractTableFromSql($sql, $conn);
+        $idColumn = $this->extractWhereIdColumn($sql, $table, $conn);
+
+        // ── Try to extract parent model + relation from the source code first ──
+        // e.g. source contains `$product->category` → parentModel=Product, relation=category
+        $sourceModel    = '';
+        $sourceRelation = '';
+        if ($sourceCurrent !== '') {
+            [$sourceModel, $sourceRelation] = $this->extractModelAndRelationFromSource($sourceCurrent);
+        }
+
+        // Use source-extracted values if available, otherwise fall back to SQL heuristics
+        $relation = $sourceRelation ?: $this->guessRelationName($sql, $table, $conn);
 
         // ── If we have source code, do a FULL intelligent rewrite ─────────────
         if ($sourceCurrent !== '') {
@@ -171,14 +185,14 @@ class OptimizationAdvisor
 
             $optimizedLaravel = $changed
                 ? "// ✅ Optimized — all lazy relations eager-loaded, N+1 eliminated\n{$rewritten}"
-                : $this->buildNPlusOneOptimizedLaravel('', $table, $relation);
+                : $this->buildNPlusOneOptimizedLaravel($sourceModel, $table, $relation);
         } else {
-            $optimizedLaravel = $this->buildNPlusOneOptimizedLaravel('', $table, $relation);
+            $optimizedLaravel = $this->buildNPlusOneOptimizedLaravel($sourceModel, $table, $relation);
         }
 
         $currentLaravel = $sourceCurrent !== ''
             ? $sourceCurrent
-            : $this->buildNPlusOneCurrentLaravel($table, $relation, $idColumn, $repetition);
+            : $this->buildNPlusOneCurrentLaravel($sourceModel, $table, $relation, $idColumn, $repetition);
 
         $description = sprintf(
             'Query ran %d× in this request — classic N+1. '
@@ -191,7 +205,7 @@ class OptimizationAdvisor
             'Resolve N+1 via eager loading',
             $description,
             $rawSql,
-            $this->buildNPlusOneOptimizedSql($sql, $table, $idColumn),
+            $this->buildNPlusOneOptimizedSql($sql, $table, $idColumn, $conn),
             120,
             false,
             currentLaravel: $currentLaravel,
@@ -199,13 +213,75 @@ class OptimizationAdvisor
         );
     }
 
-    private function buildNPlusOneCurrentLaravel(string $table, string $relation, string $idColumn, int $repetition): string
+    /**
+     * Parse source code to find the real parent model variable and relation.
+     * e.g. `$product->category` → ['Product', 'category']
+     * e.g. `$order->user`       → ['Order', 'user']
+     *
+     * @return array{0: string, 1: string} [modelName, relationName]
+     */
+    private function extractModelAndRelationFromSource(string $source): array
     {
-        $parent = 'Post';
+        // Pattern 1: $variable->relation (lazy-load access)
+        // Capture all occurrences of `$varName->propName` where propName is not a method call
+        preg_match_all('/\$(\w+)\s*->\s*([a-zA-Z_][\w]*)(?!\s*\()/u', $source, $matches, PREG_SET_ORDER);
+
+        $candidates = [];
+        foreach ($matches as $m) {
+            $varName      = $m[1]; // e.g. "product"
+            $propertyName = $m[2]; // e.g. "category"
+
+            // Skip common non-relation variables like $this, $request, $app, etc.
+            if (in_array(strtolower($varName), ['this', 'request', 'app', 'e', 'ex', 'exception'], true)) {
+                continue;
+            }
+
+            // Prefer pairs where the property looks like a relation (not a plain field like id, name, status)
+            $looksLikeRelation = !in_array(strtolower($propertyName), [
+                'id', 'name', 'title', 'slug', 'status', 'type', 'value',
+                'email', 'phone', 'created_at', 'updated_at', 'deleted_at',
+                'start_date', 'end_date', 'published', 'digital',
+            ], true);
+
+            if ($looksLikeRelation) {
+                $candidates[] = [$varName, $propertyName];
+            }
+        }
+
+        if (empty($candidates)) {
+            return ['', ''];
+        }
+
+        // Take the most frequent variable name as the parent
+        $varCounts = [];
+        foreach ($candidates as [$v]) {
+            $varCounts[$v] = ($varCounts[$v] ?? 0) + 1;
+        }
+        arsort($varCounts);
+        $dominantVar = (string) array_key_first($varCounts);
+
+        // Collect all unique relations accessed on that dominant variable
+        $relations = [];
+        foreach ($candidates as [$v, $prop]) {
+            if ($v === $dominantVar) {
+                $relations[$prop] = true;
+            }
+        }
+
+        $modelName    = Str::studly(Str::singular($dominantVar)); // product → Product
+        $relationName = (string) array_key_first($relations);     // first relation found
+
+        return [$modelName, $relationName];
+    }
+
+    private function buildNPlusOneCurrentLaravel(string $sourceModel, string $table, string $relation, string $idColumn, int $repetition): string
+    {
+        // Use source-extracted model name if available; otherwise derive from the queried table
+        $model = $sourceModel ?: ($table ? Str::studly(Str::singular($table)) : 'YourModel');
 
         return <<<PHP
 // ⚠ N+1 detected — this query ran {$repetition}× in one request
-\$items = {$parent}::all(); // loads N parent records
+\$items = {$model}::all(); // loads N parent records
 
 foreach (\$items as \$item) {
     \$item->{$relation}; // ← fires a new SELECT per iteration!
@@ -214,13 +290,14 @@ foreach (\$items as \$item) {
 PHP;
     }
 
-    private function buildNPlusOneOptimizedLaravel(string $sourceCurrent, string $table, string $relation): string
+    private function buildNPlusOneOptimizedLaravel(string $sourceModel, string $table, string $relation): string
     {
-        $parent = 'Post';
+        // Use source-extracted model name if available; otherwise derive from the queried table
+        $model = $sourceModel ?: ($table ? Str::studly(Str::singular($table)) : 'YourModel');
 
         return <<<PHP
 // ✅ Optimized — 1 query instead of N
-\$items = {$parent}::with('{$relation}')->get();
+\$items = {$model}::with('{$relation}')->get();
 
 foreach (\$items as \$item) {
     \$item->{$relation}; // already loaded — zero extra queries
@@ -228,9 +305,9 @@ foreach (\$items as \$item) {
 PHP;
     }
 
-    private function buildNPlusOneOptimizedSql(string $sql, string $table, string $idColumn): string
+    private function buildNPlusOneOptimizedSql(string $sql, string $table, string $idColumn, string $conn): string
     {
-        $parentTable = $this->guessParentTable($idColumn);
+        $parentTable = $this->guessParentTable($idColumn, $conn);
 
         if ($parentTable && $table) {
             return "-- Replace N repeated queries with ONE\n"
@@ -246,38 +323,73 @@ PHP;
     // SQL analysis helpers
     // ──────────────────────────────────────────────────────────────────────────
 
-    private function extractTableFromSql(string $sql): string
+    private function extractTableFromSql(string $sql, string $conn): string
     {
-        return preg_match('/\bfrom\s+`?([a-zA-Z_][\w]*)`?/i', $sql, $m) ? $m[1] : '';
+        if (!preg_match('/\bfrom\s+`?([a-zA-Z_][\w]*)`?/i', $sql, $m)) {
+            return '';
+        }
+
+        $table = $m[1];
+
+        // Verify with schema
+        if (!$this->tableExists($table, $conn)) {
+            return '';
+        }
+
+        return $table;
     }
 
-    private function extractWhereIdColumn(string $sql): string
+    private function extractWhereIdColumn(string $sql, string $table, string $conn): string
     {
         if (preg_match('/\bwhere\b.+?`?([a-zA-Z_][\w]*(?:_id|id))`?\s*=\s*\?/i', $sql, $m)) {
-            return $m[1];
+            $col = $m[1];
+            if ($table && $this->columnExists($table, $col, $conn)) {
+                return $col;
+            }
         }
 
         return 'id';
     }
 
-    private function guessRelationName(string $sql, string $table): string
+    private function guessRelationName(string $sql, string $table, string $conn): string
     {
-        $idCol = $this->extractWhereIdColumn($sql);
+        $idCol = $this->extractWhereIdColumn($sql, $table, $conn);
 
         if ($idCol !== 'id' && str_ends_with(strtolower($idCol), '_id')) {
-            return substr($idCol, 0, -3);
+            return Str::camel(substr($idCol, 0, -3));
         }
 
-        return $table ? rtrim($table, 's') : 'relation';
+        return $table ? Str::camel(Str::singular($table)) : 'relation';
     }
 
-    private function guessParentTable(string $idColumn): string
+    private function guessParentTable(string $idColumn, string $conn): string
     {
         if (str_ends_with(strtolower($idColumn), '_id')) {
-            return substr($idColumn, 0, -3) . 's';
+            $table = substr($idColumn, 0, -3) . 's';
+            if ($this->tableExists($table, $conn)) {
+                return $table;
+            }
         }
 
         return '';
+    }
+
+    private function tableExists(string $table, string $conn): bool
+    {
+        try {
+            return Schema::connection($conn)->hasTable($table);
+        } catch (\Throwable) {
+            return false;
+        }
+    }
+
+    private function columnExists(string $table, string $column, string $conn): bool
+    {
+        try {
+            return Schema::connection($conn)->hasColumn($table, $column);
+        } catch (\Throwable) {
+            return false;
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────────
