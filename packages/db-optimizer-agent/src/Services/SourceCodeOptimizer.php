@@ -50,6 +50,9 @@ class SourceCodeOptimizer
         // ── Phase 4: remove the now-redundant lazy-load lines ─────────────────
         $lines = $this->removeLazyLines($lines, $lazyIndexes);
 
+        // ── Phase 5: inject select() hints ────────────────────────────────────
+        $lines = $this->injectSelectClauses($lines);
+
         $rewritten = implode("\n", $lines);
 
         return [$rewritten, $rewritten !== $source];
@@ -157,9 +160,14 @@ class SourceCodeOptimizer
                 continue;
             }
 
-            $withCall = count($relations) === 1
-                ? "with('{$relations[0]}')"
-                : "with(['" . implode("', '", $relations) . "'])";
+            $formattedRelations = array_map(function($rel) {
+                return "'{$rel}:id /* add needed columns */'";
+            }, $relations);
+            
+            $withInner = implode(",\n        ", $formattedRelations);
+            $withCall = count($relations) === 1 
+                ? "with(" . $formattedRelations[0] . ")" 
+                : "with([\n        " . $withInner . "\n    ])";
 
             // Find: $var = SomeModel:: (the assignment line)
             $assignLine = null;
@@ -192,25 +200,38 @@ class SourceCodeOptimizer
             if (preg_match('/([A-Z][\w\\\\]*::)/', $lines[$assignLine])) {
                 $lines[$assignLine] = preg_replace(
                     '/([A-Z][\w\\\\]*::)(?!with\()/',
-                    '$1' . $withCall . '->',
+                    '$1' . $withCall . "\n    ->",
                     $lines[$assignLine],
                     1
                 ) ?? $lines[$assignLine];
 
                 continue;
             }
+        }
 
-            // Fallback: insert a line before the terminal method (->get/first/paginate)
-            for ($j = $assignLine; $j <= $end; $j++) {
-                if (preg_match('/^\s*->(get|first|paginate|all)\s*\(/', $lines[$j])) {
-                    preg_match('/^(\s*)/', $lines[$j], $indentM);
-                    $indent = $indentM[1] ?? '        ';
-                    array_splice($lines, $j, 0, [$indent . '->' . $withCall]);
+        return $lines;
+    }
+
+    private function injectSelectClauses(array $lines): array
+    {
+        for ($i = 0; $i < count($lines); $i++) {
+            $hasSelect = false;
+            for ($j = max(0, $i - 5); $j <= $i; $j++) {
+                if (str_contains($lines[$j], '->select(') || str_contains($lines[$j], '::select(')) {
+                    $hasSelect = true;
                     break;
                 }
             }
+            
+            if (!$hasSelect) {
+                foreach (['->get(', '->first(', '->paginate(', '->all('] as $term) {
+                    if (str_contains($lines[$i], $term)) {
+                        $lines[$i] = str_replace($term, "->select(['id' /* add needed columns */])\n    " . $term, $lines[$i]);
+                        break;
+                    }
+                }
+            }
         }
-
         return $lines;
     }
 

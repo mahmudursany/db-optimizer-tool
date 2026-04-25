@@ -20,6 +20,7 @@
 
 	@php
 		$queries = data_get($snapshot, 'queries', []);
+		$shownSuggestions = [];
 	@endphp
 
 	@if(empty($queries))
@@ -87,22 +88,30 @@
 						</div>
 					@endif
 
-					{{-- ── Missing index hints ─────────────────────────── --}}
-					@if(!empty($missingIndexes))
-						<div class="rounded-lg bg-yellow-950/30 border border-yellow-700/30 px-4 py-3 text-xs text-yellow-200 space-y-1">
-							<div class="font-semibold mb-1">Missing Indexes Detected:</div>
-							@foreach($missingIndexes as $idx)
-								<div>&bull; <code class="font-mono">`{{ $idx['table'] }}`.`{{ $idx['column'] }}`</code> — {{ $idx['reason'] ?? '' }}</div>
-							@endforeach
-						</div>
-					@endif
-
+					{{-- Missing index hints removed --}}
 					{{-- ── Recommendations ─────────────────────────────── --}}
 					@if(!empty($recommendations))
 						<div class="space-y-4">
 							<div class="text-xs font-semibold text-slate-300 uppercase tracking-wide">Optimization Suggestions</div>
 
 							@foreach($recommendations as $rec)
+								@php
+									$suggestionKey = md5(($rec['title'] ?? '') . ($rec['current_laravel'] ?? ''));
+									$alreadyShown = in_array($suggestionKey, $shownSuggestions);
+								@endphp
+
+								@if($alreadyShown)
+									<div class="rounded-xl border border-slate-700 bg-slate-950/80 p-4">
+										<div class="text-sm font-semibold text-slate-300">{{ $rec['title'] ?? 'Recommendation' }}</div>
+										<div class="text-xs text-slate-500 mt-1">Optimization code already shown in a previous query.</div>
+									</div>
+									@continue
+								@endif
+
+								@php
+									$shownSuggestions[] = $suggestionKey;
+								@endphp
+
 								<div class="rounded-xl border border-slate-700 bg-slate-950/80 p-4 space-y-3">
 
 									{{-- Title + description --}}

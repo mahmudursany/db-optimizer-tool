@@ -97,28 +97,7 @@ class OptimizationAdvisor
                 );
             }
 
-            // ── Missing indexes ────────────────────────────────────────────────
-            $missingIndexes = (array) Arr::get($metric, 'detectors.missing_indexes', []);
-            if (! empty($missingIndexes)) {
-                $first  = Arr::first($missingIndexes);
-                $table  = is_array($first) ? (string) ($first['table']  ?? 'table_name')  : 'table_name';
-                $column = is_array($first) ? (string) ($first['column'] ?? 'column_name') : 'column_name';
-
-                if ($table !== '' && $column !== '' && strtolower($column) !== 'id') {
-                    $idxName = $this->safeIndexName($table, $column);
-                    $recommendations[] = $this->make(
-                        'Add index for filter/join column',
-                        "No leading index found on `{$table}`.`{$column}`. Run the guarded migration below — safe to run multiple times.",
-                        $rawSql,
-                        "ALTER TABLE `{$table}` ADD INDEX `{$idxName}` (`{$column}`);",
-                        95,
-                        false,
-                        executableSql: $this->buildGuardedIndexSql($table, $column, $idxName),
-                        currentLaravel: $currentLaravel,
-                        optimizedLaravel: "// Add to a new migration:\nSchema::table('{$table}', function (Blueprint \$table) {\n    \$table->index('{$column}');\n});",
-                    );
-                }
-            }
+            // Missing indexes recommendation removed as per user request
 
             // ── Cache candidate ────────────────────────────────────────────────
             if ((bool) Arr::get($metric, 'detectors.cache_candidate.is_candidate', false)) {
