@@ -90,9 +90,12 @@ class SourceCodeOptimizer
         $objectRelations     = [];  // objectVar     => [relation, ...]
         $lazyIndexes         = [];  // line indexes to remove
 
+        $pattern = '/^\s*(?:\$[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*\s*=\s*)?\$([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)->([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)\s*;\s*(?:\/\/.*)?$/';
+        $pureAccessPattern = '/^\s*\$[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*->[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*\s*;\s*(?:\/\/.*)?$/';
+
         foreach ($lines as $i => $line) {
-            // Pattern: $var->relation;   (with optional trailing // comment)
-            if (! preg_match('/^\s*\$(\w+)->([a-zA-Z_]\w*)\s*;\s*(?:\/\/.*)?$/', $line, $m)) {
+            // Pattern: optional $assignment = $var->relation; (with optional trailing // comment)
+            if (! preg_match($pattern, $line, $m)) {
                 continue;
             }
 
@@ -112,7 +115,9 @@ class SourceCodeOptimizer
                 $objectRelations[$var][] = $relation;
             }
 
-            $lazyIndexes[$i] = true;
+            if (preg_match($pureAccessPattern, $line)) {
+                $lazyIndexes[$i] = true;
+            }
         }
 
         // deduplicate
