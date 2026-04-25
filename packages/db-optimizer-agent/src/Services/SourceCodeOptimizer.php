@@ -276,7 +276,7 @@ class SourceCodeOptimizer
             }
             
             if (!$hasSelect) {
-                foreach (['->get(', '->first(', '->paginate(', '->all('] as $term) {
+                foreach (['->get(', '->first(', '->paginate('] as $term) {
                     if (str_contains($lines[$i], $term)) {
                         $lines[$i] = str_replace($term, "->select(['id' /* add ALL foreign keys & needed columns */])\n    " . $term, $lines[$i]);
                         break;
@@ -308,6 +308,13 @@ class SourceCodeOptimizer
                 }
                 
                 if ($inLoop) {
+                    if (isset($lines[$injectLine - 1]) && str_contains($lines[$injectLine - 1], 'ARCHITECTURE WARNING')) {
+                        continue;
+                    }
+                    if (isset($lines[$injectLine - 2]) && str_contains($lines[$injectLine - 2], 'ARCHITECTURE WARNING')) {
+                        continue;
+                    }
+                    
                     preg_match('/^(\s*)/', $lines[$injectLine], $indentM);
                     $indent = $indentM[1] ?? '        ';
                     array_splice($lines, $injectLine, 0, [$indent . '// ⚠️ ARCHITECTURE WARNING: Calling find() inside a loop is an N+1 pattern.']);

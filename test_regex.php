@@ -1,7 +1,8 @@
 <?php
-$line = "        \$category->parent; // Query 2 - parent load করছে আলাদাভাবে";
-if (preg_match('/^\s*\$(\w+)->([a-zA-Z_]\w*)\s*;\s*(?:\/\/.*)?$/', $line, $m)) {
-    echo "Matched: " . $m[1] . " -> " . $m[2] . "\n";
-} else {
-    echo "Failed\n";
-}
+$sourceCode = "Category::all();\nDB::table('languages')->get();";
+$replaced = preg_replace_callback('/(::|\->)(get|first|all|paginate|cursor|chunk)\s*\(/', function($matches) {
+            $method = $matches[2];
+            $prefix = $matches[1];
+            return "->select(['id' /* add required columns */])\n    {$prefix}{$method}(";
+        }, $sourceCode);
+echo $replaced;
