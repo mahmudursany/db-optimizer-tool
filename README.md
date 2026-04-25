@@ -1,3 +1,11 @@
+এখন তোমার existing project-এ update নিতে:
+
+composer require mdj/db-optimizer-agent:^1.4 --dev
+php artisan optimize:clear
+php artisan config:clear
+/_db-optimizer এ গিয়ে snapshot details refresh করে দেখো।
+
+
 <p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
 
 <p align="center">
@@ -114,3 +122,94 @@ Package guide:
 - `packages/db-optimizer-agent/README.md`
 - `PACKAGIST_PUBLISH.md`
 - `DB_OPTIMIZER_STEP_BY_STEP_BN.md`
+
+
+1) Project requirements check
+PHP: 8.1+
+Laravel: 8/9/10/11
+2) Package install
+Project root-এ চালাও:
+
+composer require mdj/db-optimizer-agent:^1.2 --dev
+যদি dependency conflict আসে:
+
+composer require mdj/db-optimizer-agent:^1.2 --dev -W
+3) Config publish
+php artisan vendor:publish --tag=db-optimizer-config
+4) .env configure
+নিচেরগুলো add/update করো:
+
+DB_OPTIMIZER_ENABLED=true
+DB_OPTIMIZER_AGENT_TOKEN=your-strong-token
+DB_OPTIMIZER_ROUTE_PREFIX=_db-optimizer
+DB_OPTIMIZER_SAMPLE_RATE=1
+DB_OPTIMIZER_SLOW_MS=50
+DB_OPTIMIZER_ADVANCED_SUGGESTIONS=true
+DB_OPTIMIZER_AUTO_APPLY_SAFE=false
+DB_OPTIMIZER_RECOMMENDATION_LIMIT=8
+5) Clear cache
+php artisan optimize:clear
+6) Route verify
+php artisan route:list --path=_db-optimizer
+তুমি 7টা route দেখতে পাবে (dashboard, scanner, agent endpoints)।
+
+7) App চালাও
+php artisan serve
+অথবা Herd domain ব্যবহার করো।
+তারপর browser:
+
+/_db-optimizer
+/_db-optimizer/scanner
+8) Quick test (agent)
+curl -H "Authorization: Bearer your-strong-token" http://your-domain.test/_db-optimizer/agent/ping
+ok: true এলে setup ঠিক।
+
+Existing project-এ conflict avoid tips
+Route conflict হলে:
+DB_OPTIMIZER_ROUTE_PREFIX=_internal-db-optimizer
+Production এ default off রাখো:
+DB_OPTIMIZER_ENABLED=false
+Test environment side-effect না চাইলে:
+DB_OPTIMIZER_CAPTURE_TESTING=false
+
+
+-----
+
+এখন তোমার existing project-এ update নিতে:
+
+composer require mdj/db-optimizer-agent:^1.4 --dev
+php artisan optimize:clear
+php artisan config:clear
+/_db-optimizer এ গিয়ে snapshot details refresh করে দেখো।
+
+
+-----
+
+
+দারুণ — old version install করা থাকলে update খুব সহজ।
+
+Existing project-এ v1.3.0 নেওয়ার step
+Project root-এ গিয়ে package upgrade:
+composer require mdj/db-optimizer-agent:^1.3 --dev
+config publish/update (নতুন keys আনতে):
+php artisan vendor:publish --tag=db-optimizer-config --force
+.env এ নতুন/important keys নিশ্চিত করো:
+DB_OPTIMIZER_ENABLED=true
+DB_OPTIMIZER_AGENT_TOKEN=your-token
+DB_OPTIMIZER_ROUTE_PREFIX=_db-optimizer
+DB_OPTIMIZER_ADVANCED_SUGGESTIONS=true
+DB_OPTIMIZER_AUTO_APPLY_SAFE=false
+DB_OPTIMIZER_RECOMMENDATION_LIMIT=8
+cache clear:
+php artisan optimize:clear
+route verify:
+php artisan route:list --path=_db-optimizer
+app চালিয়ে snapshot detail page open করো:
+/_db-optimizer/snapshots/{id}
+এখন query block-এর নিচে Suggested Rewrites / New Query দেখাবে।
+যদি update না নেয়
+lock conflict হলে:
+composer require mdj/db-optimizer-agent:^1.3 --dev -W
+still old দেখালে:
+composer show mdj/db-optimizer-agent
+এখানে version v1.3.0 হওয়া লাগবে।
