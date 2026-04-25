@@ -31,9 +31,20 @@ class QueryMetricsStore
             return;
         }
 
-        // ── Only persist queries that have at least one actionable issue ───────
+        // ── Step 1: Deduplicate by fingerprint ───────────────────────────────
+        // When a query runs N times (N+1 pattern), each execution is recorded
+        // separately with an increasing repetition counter. We only want to keep
+        // the LAST entry per fingerprint (highest repetition, is_suspected=true).
+        $deduped = [];
+        foreach ($this->buffer as $q) {
+            $fp = (string) ($q['fingerprint'] ?? md5($q['sql'] ?? ''));
+            // Always overwrite — last recorded entry has the highest repetition count
+            $deduped[$fp] = $q;
+        }
+
+        // ── Step 2: Keep only queries with actionable issues ─────────────────
         $actionable = array_values(array_filter(
-            $this->buffer,
+            $deduped,
             static function (array $q): bool {
                 // Slow query (has EXPLAIN result)
                 if (isset($q['explain'])) {
@@ -51,7 +62,7 @@ class QueryMetricsStore
                     return true;
                 }
 
-                // Has a recommendation with meaningful optimized SQL
+                // Has at least one recommendation
                 $recommendations = $q['recommendations'] ?? [];
                 if (is_array($recommendations) && $recommendations !== []) {
                     return true;
@@ -68,12 +79,12 @@ class QueryMetricsStore
             return;
         }
 
-        // Strip heavy fields from each query to keep JSON lean
+        // ── Step 3: Slim down each query record ──────────────────────────────
         $slim = array_map(static function (array $q): array {
-            // Remove raw bindings array (can be huge) — raw_sql already has values interpolated
+            // raw_sql already has bindings interpolated — drop the raw array
             unset($q['bindings']);
 
-            // Trim source_code snippet — keep only the current snippet, not duplicates
+            // Keep only the 'current' source snippet
             if (isset($q['source_code']['current'])) {
                 $q['source_code'] = ['current' => $q['source_code']['current']];
             }
@@ -85,9 +96,9 @@ class QueryMetricsStore
         $path = trim((string) config('db_optimizer.storage_path', 'db-optimizer'), '/');
 
         $payload = [
-            'captured_at'  => now()->toIso8601String(),
-            'meta'         => $meta,
-            'queries'      => $slim,
+            'captured_at' => now()->toIso8601String(),
+            'meta'        => $meta,
+            'queries'     => array_values($slim),
         ];
 
         $line = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
