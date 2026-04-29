@@ -6,7 +6,7 @@ namespace Mdj\DbOptimizer\Services;
  * Analyses a PHP source snippet and rewrites it to:
  *  1. Inject ->with([...]) for every detected lazy relation access
  *  2. Remove the now-redundant lazy-load lines
- *  3. Add ->select([...]) hints as inline comments
+ *  3. Keep the output copy-paste safe and free of placeholder comments
  */
 class SourceCodeOptimizer
 {
@@ -49,12 +49,6 @@ class SourceCodeOptimizer
 
         // ── Phase 4: remove the now-redundant lazy-load lines ─────────────────
         $lines = $this->removeLazyLines($lines, $lazyIndexes);
-
-        // ── Phase 5: inject select() hints ────────────────────────────────────
-        $lines = $this->injectSelectClauses($lines);
-
-        // ── Phase 6: inject architecture warnings ─────────────────────────────
-        $lines = $this->injectArchitectureWarnings($lines);
 
         $rewritten = implode("\n", $lines);
 
@@ -220,7 +214,7 @@ class SourceCodeOptimizer
             }
 
             $formattedRelations = array_map(function($rel) {
-                return "'{$rel}:id /* add columns */'";
+                return "'{$rel}'";
             }, $filteredRelations);
             
             $withInner = implode(",\n        ", $formattedRelations);
@@ -265,68 +259,6 @@ class SourceCodeOptimizer
             }
         }
 
-        return $lines;
-    }
-
-    private function injectSelectClauses(array $lines): array
-    {
-        for ($i = 0; $i < count($lines); $i++) {
-            $hasSelect = false;
-            for ($j = max(0, $i - 5); $j <= $i; $j++) {
-                if (str_contains($lines[$j], '->select(') || str_contains($lines[$j], '::select(')) {
-                    $hasSelect = true;
-                    break;
-                }
-            }
-            
-            if (!$hasSelect) {
-                foreach (['->get(', '->first(', '->paginate('] as $term) {
-                    if (str_contains($lines[$i], $term)) {
-                        $lines[$i] = str_replace($term, "->select(['id' /* add ALL foreign keys & needed columns */])\n    " . $term, $lines[$i]);
-                        break;
-                    }
-                }
-            }
-        }
-        return $lines;
-    }
-
-    private function injectArchitectureWarnings(array $lines): array
-    {
-        for ($i = 0; $i < count($lines); $i++) {
-            if (preg_match('/(?:->|::)find\s*\(\s*\$/', $lines[$i])) {
-                $injectLine = $i;
-                for ($j = $i; $j >= max(0, $i - 3); $j--) {
-                    if (preg_match('/=\s*[A-Z][\w\\\\]*::/', $lines[$j])) {
-                        $injectLine = $j;
-                        break;
-                    }
-                }
-                
-                $inLoop = false;
-                for ($j = max(0, $injectLine - 10); $j < $injectLine; $j++) {
-                    if (preg_match('/\b(foreach|while|for)\b/', $lines[$j])) {
-                        $inLoop = true;
-                        break;
-                    }
-                }
-                
-                if ($inLoop) {
-                    if (isset($lines[$injectLine - 1]) && str_contains($lines[$injectLine - 1], 'ARCHITECTURE WARNING')) {
-                        continue;
-                    }
-                    if (isset($lines[$injectLine - 2]) && str_contains($lines[$injectLine - 2], 'ARCHITECTURE WARNING')) {
-                        continue;
-                    }
-                    
-                    preg_match('/^(\s*)/', $lines[$injectLine], $indentM);
-                    $indent = $indentM[1] ?? '        ';
-                    array_splice($lines, $injectLine, 0, [$indent . '// ⚠️ ARCHITECTURE WARNING: Calling find() inside a loop is an N+1 pattern.']);
-                    array_splice($lines, $injectLine + 1, 0, [$indent . '// Consider refactoring to use ->whereIn(\'id\', $ids) outside the loop!']);
-                    $i += 2;
-                }
-            }
-        }
         return $lines;
     }
 

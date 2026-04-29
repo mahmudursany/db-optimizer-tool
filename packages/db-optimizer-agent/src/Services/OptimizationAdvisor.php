@@ -45,28 +45,8 @@ class OptimizationAdvisor
                 : $this->buildLaravelBuilderFromSql($rawSql);
 
             // ── SELECT * ──────────────────────────────────────────────────────
-            if (str_starts_with($normalizedSql, 'select') && str_contains($normalizedSql, 'select *')) {
-                [$optimizedLaravel, $changed] = $this->codeOptimizer->rewrite($currentLaravel);
-
-                // If SourceCodeOptimizer rewrote the function (N+1 fix + select hint), use that.
-                // Otherwise fall back to a simple select column hint.
-                if (! $changed) {
-                    $optimizedLaravel = $this->optimizeSelectAllLaravel($currentLaravel);
-                }
-
-                $optimizedSql = preg_replace('/\bselect\s+\*/i', 'SELECT id, name /* add required columns */', $rawSql) ?? $rawSql;
-
-                $recommendations[] = $this->make(
-                    'Select only needed columns',
-                    'Avoid SELECT * — specify only the columns your view actually uses to reduce IO and memory.',
-                    $rawSql,
-                    $optimizedSql,
-                    92,
-                    true,
-                    currentLaravel: $currentLaravel,
-                    optimizedLaravel: $optimizedLaravel,
-                );
-            }
+            // Intentionally skipped: without knowing the exact view/model columns,
+            // the package should not generate unsafe placeholder selects.
 
             // ── EXISTS (SELECT *) ──────────────────────────────────────────────
             if ((bool) preg_match('/\bexists\s*\(\s*select\s+\*/i', $normalizedSql)) {
@@ -184,7 +164,7 @@ class OptimizationAdvisor
             [$rewritten, $changed] = $this->codeOptimizer->rewrite($sourceCurrent);
 
             $optimizedLaravel = $changed
-                ? "// ✅ Optimized — all lazy relations eager-loaded, N+1 eliminated\n{$rewritten}"
+                ? $rewritten
                 : $this->buildNPlusOneOptimizedLaravel($sourceModel, $table, $relation);
         } else {
             $optimizedLaravel = $this->buildNPlusOneOptimizedLaravel($sourceModel, $table, $relation);
