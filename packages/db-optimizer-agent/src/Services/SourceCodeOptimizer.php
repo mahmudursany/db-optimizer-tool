@@ -16,6 +16,7 @@ class SourceCodeOptimizer
         'email', 'password', 'name', 'status', 'type',
         'title', 'body', 'content', 'slug', 'price',
         'quantity', 'published', 'approved', 'order_level',
+        'value', 'data', 'code', 'key', 'message', 'count',
     ];
 
     /**
@@ -88,7 +89,8 @@ class SourceCodeOptimizer
         $lazyIndexes         = [];  // line indexes to remove
         $aliases             = [];  // var => ['parent' => parentVar, 'rel' => relation]
 
-        $accessPattern = '/^\s*(?:(?:\$([a-zA-Z0-9_\x7f-\xff]+)\s*=\s*)(?:\$[a-zA-Z0-9_\x7f-\xff]+\s*\?\s*)?)?\$([a-zA-Z0-9_\x7f-\xff]+)->([a-zA-Z0-9_\x7f-\xff]+)\s*(?:\:\s*null\s*)?;\s*(?:\/\/.*)?$/';
+        // Match: $var->relation;  OR  $result = $var->relation;  OR  $var->load('rel');  etc.
+        $accessPattern = '/^\s*(?:(?:\$([a-zA-Z0-9_\x7f-\xff]+)\s*=\s*)(?:\$[a-zA-Z0-9_\x7f-\xff]+\s*\?\s*)?)?(?:\$([a-zA-Z0-9_\x7f-\xff]+)->([a-zA-Z0-9_\x7f-\xff]+)|\$([a-zA-Z0-9_\x7f-\xff]+)->load\(\s*[\'\"]([a-zA-Z0-9_\.]+)[\'\"]\s*\))\s*(?:\:\s*null\s*)?;\s*(?:\/\/.*)?$/';
         $pureAccessPattern = '/^\s*\$[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*->[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*\s*;\s*(?:\/\/.*)?$/';
 
         foreach ($lines as $i => $line) {
@@ -216,10 +218,10 @@ class SourceCodeOptimizer
             $formattedRelations = array_map(function($rel) {
                 return "'{$rel}'";
             }, $filteredRelations);
-            
+
             $withInner = implode(",\n        ", $formattedRelations);
-            $withCall = count($filteredRelations) === 1 
-                ? "with(" . $formattedRelations[0] . ")" 
+            $withCall = count($filteredRelations) === 1
+                ? "with(" . $formattedRelations[0] . ")"
                 : "with([\n        " . $withInner . "\n    ])";
 
             // Find ALL assignments: $var = SomeModel::

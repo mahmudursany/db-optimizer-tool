@@ -139,21 +139,24 @@ class QueryInterceptor
      */
     private function nPlusOneSignal(string $sql, int $repetition, array $origin): array
     {
-        $threshold = (int) config('db_optimizer.n_plus_one_repeat_threshold', 5);
+        // Lower threshold aggressively — even 3 repetitions of the same SELECT is often N+1
+        $threshold = (int) config('db_optimizer.n_plus_one_repeat_threshold', 3);
         $isSelect  = str_starts_with(strtolower(ltrim($sql)), 'select');
 
         // Match queries that look like single-row relation fetches:
-        // WHERE `post_id` = ? OR WHERE `id` = ?
+        // WHERE `post_id` = ? OR WHERE `id` = ? OR WHERE `user_id` = ?
         $hasWhereBinding      = (bool) preg_match('/\bwhere\b.+?=\s*\?/i', $sql);
         $looksLikeRelationLoad = (bool) preg_match('/\bwhere\b.+?`?(?:[a-z_]+_id|\bid)\b`?\s*=\s*\?/i', $sql);
         $isLimitOne           = (bool) preg_match('/\blimit\s+1\b/i', $sql);
+        $isCountOrExists      = (bool) preg_match('/\b(count|exists)\s*\(/i', $sql);
 
         // Suspect N+1 when:
         // 1. It's a SELECT with a WHERE ? binding
-        // 2. Looks like a relation lookup (has _id or id column)
-        // 3. Repeats >= threshold times in this request
-        $looksLikeSingleRow = $isSelect && $hasWhereBinding && ($looksLikeRelationLoad || $isLimitOne);
-        $suspected          = $repetition >= $threshold && $looksLikeSingleRow;
+        // 2. Looks like a relation lookup (has _id or id column in WHERE)
+        // 3. Either LIMIT 1 or COUNT/EXISTS pattern OR repeats >= threshold
+        // More aggressive: even single-relation loads repeated 3+ times count as N+1
+        $looksLikeSingleRow = $isSelect && $hasWhereBinding && $looksLikeRelationLoad;
+        $suspected          = $looksLikeSingleRow && ($isLimitOne || $isCountOrExists || $repetition >= $threshold);
 
         return [
             'is_suspected'  => $suspected,
